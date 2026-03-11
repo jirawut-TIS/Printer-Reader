@@ -1,26 +1,17 @@
-# 🖨️ Printer Usage Reader
+# 🖨️ Printer Usage Reader v2.2
 
 อ่านข้อมูลจาก HP Printer Report PDF และ Export Excel  
 รองรับ PDF 200+ หน้า · ใช้งานบนมือถือได้ · **ฟรีทั้งหมด**
 
 ---
 
-## ✨ วิธีทำงาน
+## ✨ Features
 
-```
-PDF (ผู้ใช้เลือก)
-  │
-  ▼  PDF.js — แปลงเป็นรูป JPEG ในเบราว์เซอร์ (ไม่ upload ไฟล์ขึ้น server)
-รูปภาพทีละหน้า
-  │
-  ▼  Parallel Batches — ส่ง 4 หน้า × 4 threads พร้อมกัน = 16 หน้า/รอบ
-/api/extract (Next.js Edge Function — 25s timeout)
-  │
-  ▼  Claude AI
-JSON: serial, a5_impressions, grand_total, model
-  │
-  ▼  ตาราง + Export Excel
-```
+- 📄 อ่าน HP Printer Usage Report PDF (ภาษาไทย + English)
+- ⚡ Pipeline Parallel Processing — render + AI พร้อมกัน
+- 📍 กรอกสถานที่และวันที่ → ใส่ใน Excel อัตโนมัติ
+- 📊 Export Excel พร้อม header สถานที่/วันที่
+- 🔒 PDF ประมวลผลในเบราว์เซอร์ — ไม่ upload ขึ้น server
 
 ---
 
@@ -28,14 +19,10 @@ JSON: serial, a5_impressions, grand_total, model
 
 ### Step 1 — สร้าง GitHub repo
 
-1. ไปที่ [github.com](https://github.com) → **New repository**
-2. ตั้งชื่อ `printer-reader` → กด **Create repository**
-3. รันคำสั่งนี้ในโฟลเดอร์โปรเจกต์:
-
 ```bash
 git init
 git add .
-git commit -m "Initial commit"
+git commit -m "Printer Reader v2.2"
 git remote add origin https://github.com/YOUR_USERNAME/printer-reader.git
 git branch -M main
 git push -u origin main
@@ -44,21 +31,17 @@ git push -u origin main
 ### Step 2 — Deploy บน Vercel (ฟรี)
 
 1. ไปที่ [vercel.com](https://vercel.com) → สมัครด้วย GitHub
-2. กด **Add New → Project**
-3. เลือก repo `printer-reader` → กด **Deploy**
-4. รอ ~1 นาที → ได้ URL เช่น `https://printer-reader-xxx.vercel.app`
+2. กด **Add New → Project** → เลือก repo `printer-reader` → กด **Deploy**
 
 ### Step 3 — ใส่ API Key
 
 1. Vercel Dashboard → Project → **Settings → Environment Variables**
-2. กด **Add**:
+2. เพิ่ม:
    ```
    Name:  ANTHROPIC_API_KEY
-   Value: sk-ant-xxxxxxxxxx   ← key จาก console.anthropic.com
+   Value: sk-ant-xxxxxxxxxx
    ```
-3. กด **Save** แล้วไปที่ **Deployments → ⋯ → Redeploy**
-
-✅ เสร็จแล้ว! เปิด URL แล้วใช้งานได้เลย
+3. **Deployments → ⋯ → Redeploy**
 
 ---
 
@@ -74,16 +57,27 @@ npm run dev
 
 ---
 
-## 📊 Performance (Free tier)
+## ⚙️ ปรับ Performance
+
+แก้ใน `app/page.jsx` บรรทัดบนสุด:
+
+```js
+const PAGES_PER_BATCH = 4;  // หน้าต่อ 1 API call (ลดเป็น 2 ถ้า timeout)
+const PARALLEL_CALLS  = 6;  // API calls พร้อมกัน
+```
+
+---
+
+## 📊 Performance
 
 | PDF ขนาด | เวลาโดยประมาณ |
 |----------|--------------|
-| 10 หน้า  | ~15 วินาที   |
-| 50 หน้า  | ~1 นาที      |
-| 100 หน้า | ~2 นาที      |
-| 200 หน้า | ~4 นาที      |
+| 10 หน้า  | ~6–8 วินาที  |
+| 50 หน้า  | ~30 วินาที   |
+| 100 หน้า | ~1 นาที      |
+| 200 หน้า | ~2 นาที      |
 
-*4 parallel threads × 4 หน้า/call = 16 หน้าพร้อมกัน*
+*Pipeline: render group N+1 ขณะที่ AI process group N พร้อมกัน*
 
 ---
 
@@ -94,13 +88,3 @@ npm run dev
 | Vercel | Hobby (Free) | ฟรี |
 | GitHub | Free | ฟรี |
 | Anthropic API | Pay-as-you-go | ~$0.003/หน้า ≈ ฿0.10/หน้า |
-
-**PDF 200 หน้า ≈ $0.60 (~฿22) ต่อครั้ง**
-
----
-
-## ⚠️ ข้อจำกัด Free Tier
-
-- **Vercel Edge Function timeout: 25 วินาที** — แต่ละ batch (4 หน้า) ต้องเสร็จใน 25s
-- ถ้า timeout บ่อย → ลด `PAGES_PER_BATCH` จาก 4 → 2 ใน `app/page.jsx`
-- **iOS Safari + PDF ใหญ่** อาจ crash เพราะ RAM น้อย → ใช้ Chrome แทน

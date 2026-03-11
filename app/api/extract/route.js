@@ -1,128 +1,176 @@
-export const runtime = "edge";
+/**
+ * POST /api/extract
+ * รับ base64 JPEG images (1–4 หน้า) → ส่ง Claude Vision → คืน JSON
+ *
+ * Body  : { images: string[], pageNums: number[] }
+ * Return: { results: Array<{serial, model, printA5, grandTotal} | null> }
+ *
+ * กฎการอ่าน A5 ที่ถูกต้อง:
+ *   - อ่านจาก PRINT section เท่านั้น (ไม่รวม Copy)
+ *   - ใช้ค่าจาก Total column โดยตรง (ไม่ × Units 0.5)
+ *   - Grand Total อ่านจาก Equivalent Impressions section
+ */
 
-const SYSTEM_PROMPT = `You are extracting data from HP printer usage report pages.
-Reports may be in ENGLISH or THAI — handle both languages equally.
+export const runtime    = "edge";
+export const maxDuration = 25;        // Vercel Hobby = 25s
 
-══════════════════════════════════════════════
-THAI ↔ ENGLISH TERM MAPPING (use either):
-══════════════════════════════════════════════
-  Section / Table names:
-    EN: "Equivalent Impressions (Letter/A4)"
-    TH: "การพิมพ์เทียบเท่า (Letter/A4)"  or  "งานพิมพ์เทียบเท่า A4"
+const CLAUDE_API = "https://api.anthropic.com/v1/messages";
+const MODEL      = "claude-opus-4-6";
 
-  Row labels:
-    EN: "Grand Total"          TH: "ยอดรวม"
-    EN: "Print"                TH: "พิมพ์"
-    EN: "Copy"                 TH: "ถ่ายสำเนา"
-    EN: "Total Pages Printed"  TH: "จำนวนหน้าพิมพ์ทั้งหมด"
+/* ─── System Prompt ────────────────────────────────────────────────────────── */
+const SYSTEM = `You are a precise data extractor for HP Printer Usage Report pages.
+Each image is one scanned "Usage Page" from an HP printer.
 
-  Column labels:
-    EN: "Monochrome" / "Black-and-White"   TH: "ขาวดำ"
-    EN: "Color"                             TH: "สี"
-    EN: "Total"                             TH: "รวม"
+Extract these 4 fields per page:
 
-  Impressions section:
-    EN: "Impressions" → sub-table "Print"   TH: "การพิมพ์" → sub-section "พิมพ์"
-    Paper size A5 row: same label in both languages
+════════════════════════════════
+1. serial — Product Serial Number
+════════════════════════════════
+Read from the "Device Information" section, line "Product Serial Number:".
 
-══════════════════════════════════════════════
-GROUP 1 — MONO: M406, M430
-══════════════════════════════════════════════
-  grand_total = "Grand Total"/"ยอดรวม" row → "Total"/"รวม" column
-                in the Equivalent Impressions table
-  a5_print    = A5 row → "Total"/"รวม" column
-                in Print sub-table of Impressions section (raw count, NOT ×0.5)
-  bw_total=0, color_total=0, a4_print=0, a3_print=0
+⚠️ CRITICAL OCR RULES — common scan errors on HP serials:
+  • Digit "6" vs Letter "G" — HP serials use DIGIT "6", NEVER letter "G" inside the number portion.
+    ✅ CNBRS650GY  (digit 6, digit 5, digit 0, then letters GY at the END)
+    ❌ CNBRSG50GY  (wrong — G is not a digit here)
+    Rule: if you see what looks like "G" followed by digits, it is almost certainly digit "6".
+  • Digit "8" vs Letter "B" — HP serials use DIGIT "8", NEVER letter "B" mid-serial.
+    ✅ CNBRS651F8   ❌ CNBRS651FB
+    ✅ CNBRS6509F   ❌ CNBRS650BF
+  • Digit "0" vs Letter "O" — read carefully from context.
+  • Digit "1" vs Letter "I" — read carefully from context.
+  Known serial patterns (10 chars, all uppercase):
+    PHCBG29182, PHCBG31125, PHCBG29972, PHCBG28280
+    CNBRS650GY, CNBRS651F8, CNBRS650K6, CNBRS6509F, CNBRS650MB, CNBRS650HQ
 
-══════════════════════════════════════════════
-GROUP 2 — MONO: M428, M404, M4103, M4003
-══════════════════════════════════════════════
-  grand_total = "Total Pages Printed" / "จำนวนหน้าพิมพ์ทั้งหมด" value
-                (shown near the top of the report as the main engine count)
-  a5_print    = A5 / "ISO and JIS A5" row → "Total"/"รวม" column
-                in the Print media size table
-  bw_total=0, color_total=0, a4_print=0, a3_print=0
+════════════════════════════════
+2. model — Product Name
+════════════════════════════════
+Examples: HP LaserJet M406, HP LaserJet MFP M430
 
-══════════════════════════════════════════════
-GROUP 3 — COLOR: M480, M455
-══════════════════════════════════════════════
-  Table: "Equivalent Impressions (Letter/A4)" or "การพิมพ์เทียบเท่า (Letter/A4)"
-  Columns: Monochrome/ขาวดำ | Color/สี | Total/รวม
-  Rows: Print/พิมพ์, Copy/ถ่ายสำเนา, Fax, Grand Total/ยอดรวม
+════════════════════════════════
+3. printA5 — A5 count from PRINT table only
+════════════════════════════════
+  • Look ONLY at the table under heading "Print" inside "Impressions" section.
+  • Find the row whose Paper Size column contains "A5" or "148x210".
+  • ⚠️ "Legal (8.5x14)" is NOT A5. "Letter (8.5x11)" is NOT A5. Only rows with "A5" or "148x210".
+  • Return the number in the rightmost "Total" column of the A5 row. DO NOT multiply or divide.
+  • DO NOT include A5 from the "Copy" table.
+  • If no A5 row exists in Print → return 0.
+  Examples:
+    Print row: "A5 (148x210mm) | 0.5 | 20,318"  → printA5 = 20318
+    Print row: "A5 (148x210 mm) | 0.5 | 8,307"  → printA5 = 8307
+    Print row: "Legal (8.5x14) | 1.3 | 146"      → printA5 = 0 (Legal is NOT A5)
+    No A5 row in Print table                      → printA5 = 0
 
-  ⚠️ Read from "Grand Total" / "ยอดรวม" row ONLY:
-    bw_total    = Grand Total/ยอดรวม → Monochrome/ขาวดำ column
-    color_total = Grand Total/ยอดรวม → Color/สี column
-    grand_total = Grand Total/ยอดรวม → Total/รวม column
+════════════════════════════════
+4. grandTotal — from Equivalent Impressions section
+════════════════════════════════
+  • Read ONLY from the section titled "Equivalent Impressions (Letter/A4)".
+  • That section has rows: Print, Copy, Fax, Grand Total.
+  • Read the "Grand Total" row value EXACTLY as printed — keep all decimals.
+  • ⚠️ DO NOT round. DO NOT truncate. DO NOT add .0 if not printed.
+    If printed as "60,519.5"  → grandTotal = 60519.5  (NOT 60520)
+    If printed as "143,225.5" → grandTotal = 143225.5 (NOT 143226)
+    If printed as "14,173.5"  → grandTotal = 14173.5  (NOT 14174)
+    If printed as "20,231.1"  → grandTotal = 20231.1  (NOT 20231 or 20232)
+    If printed as "71,142.0"  → grandTotal = 71142.0
+    If printed as "10,291.0"  → grandTotal = 10291.0
+  • DO NOT use values from "Scan Counts by Size", "Scan Counts by Destination",
+    or individual paper-size rows (Legal 146, A4 15965 etc.) as Grand Total.
+  • The Grand Total is always the LARGEST summary number in the Equivalent Impressions table.
 
-  a5_print=0, a4_print=0, a3_print=0
+════════════════════════════════
+Output format
+════════════════════════════════
+Return ONLY a valid JSON array, no markdown, no explanation:
+[
+  {"serial":"...","model":"...","printA5":0,"grandTotal":0.0},
+  ...
+]
+Array length MUST equal the number of images sent.
+Non-Usage pages → null:
+[null, {"serial":"...","model":"...","printA5":0,"grandTotal":0.0}]`;
 
-══════════════════════════════════════════════
-ALL OTHER MODELS — standard rules:
-══════════════════════════════════════════════
-  Use the Equivalent Impressions table (EN or TH):
-    grand_total = Grand Total/ยอดรวม row → Total/รวม column
-    bw_total    = Monochrome/ขาวดำ row → Total/รวม  (0 if not present)
-    color_total = Color/สี row → Total/รวม  (0 if mono)
-
-  Use the Print sub-table of Impressions section (EN or TH):
-    a3_print = A3 row → Total/รวม column
-    a4_print = A4 / Letter row → Total/รวม column
-    a5_print = A5 row → Total/รวม column  (raw count, NOT ×0.5)
-
-══════════════════════════════════════════════
-RULES:
-- Never use Copy/ถ่ายสำเนา or Scan or Fax values for a3/a4/a5_print
-- Decimal numbers → round to nearest integer
-- Return ONLY a JSON array. No markdown, no explanation, no code fences
-- One object per image, in SAME ORDER. Never skip an image.
-- Missing: 0 for numbers, "N/A" for strings
-
-OUTPUT FORMAT:
-[{"serial":"CNCRSC30F3","model":"HP Color LaserJet MFP M480","a3_print":0,"a4_print":0,"a5_print":0,"bw_total":12973,"color_total":12771,"grand_total":25744}]`;
-
+/* ─── Edge handler ─────────────────────────────────────────────────────────── */
 export async function POST(req) {
-  try {
-    const { images, batchIndex } = await req.json();
-    if (!Array.isArray(images) || images.length === 0)
-      return Response.json({ error: "No images provided" }, { status: 400 });
-
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey)
-      return Response.json({ error: "ANTHROPIC_API_KEY not set" }, { status: 500 });
-
-    const content = images.flatMap((b64, i) => [
-      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
-      { type: "text", text: `Image ${i + 1} of ${images.length}` },
-    ]);
-    content.push({
-      type: "text",
-      text: `Extract data from all ${images.length} image(s) above in order. Return a JSON array with exactly ${images.length} object(s).`,
-    });
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 2048,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content }],
-      }),
-    });
-
-    const data = await res.json();
-    if (!res.ok)
-      return Response.json({ error: data.error?.message || "Claude API error" }, { status: 500 });
-
-    const text = data.content.filter(b => b.type === "text").map(b => b.text).join("");
-    const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-    return Response.json({ results: parsed, batchIndex: batchIndex ?? 0 });
-  } catch (err) {
-    return Response.json({ error: err.message }, { status: 500 });
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return Response.json({ error: "ANTHROPIC_API_KEY not set" }, { status: 500 });
   }
+
+  let body;
+  try { body = await req.json(); }
+  catch { return Response.json({ error: "Invalid JSON body" }, { status: 400 }); }
+
+  const { images, pageNums } = body;
+  if (!Array.isArray(images) || !images.length) {
+    return Response.json({ error: "images[] required" }, { status: 400 });
+  }
+
+  /* Build message content — one text label + one image per page */
+  const content = [];
+  images.forEach((b64, i) => {
+    content.push({ type: "text", text: `Page ${pageNums?.[i] ?? i + 1}:` });
+    content.push({
+      type:   "image",
+      source: { type: "base64", media_type: "image/jpeg", data: b64 },
+    });
+  });
+  content.push({
+    type: "text",
+    text: `Extract data from all ${images.length} page(s) above. Return a JSON array with exactly ${images.length} element(s).`,
+  });
+
+  /* Call Claude */
+  const claudeRes = await fetch(CLAUDE_API, {
+    method:  "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "x-api-key":         apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model:      MODEL,
+      max_tokens: 1024,
+      system:     SYSTEM,
+      messages:   [{ role: "user", content }],
+    }),
+  });
+
+  if (!claudeRes.ok) {
+    console.error("Claude error:", await claudeRes.text());
+    return Response.json({ results: images.map(() => null) });
+  }
+
+  const data = await claudeRes.json();
+  const raw  = data.content?.[0]?.text ?? "[]";
+
+  /* Parse JSON — strip markdown fences if present */
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+  } catch {
+    console.error("JSON parse failed:", raw);
+    return Response.json({ results: images.map(() => null) });
+  }
+
+  /* Normalise & validate */
+  const arr = Array.isArray(parsed) ? parsed : images.map(() => null);
+  while (arr.length < images.length) arr.push(null);
+
+  const results = arr.slice(0, images.length).map((r) => {
+    if (!r || !r.serial) return null;
+
+    const rawGT = String(r.grandTotal ?? "0").replace(/,/g, "");
+    const gt    = Math.floor(parseFloat(rawGT));  // ตัดทศนิยมออก ไม่ปัดขึ้น
+
+    return {
+      serial:     String(r.serial).trim().toUpperCase(),
+      model:      String(r.model  ?? "HP LaserJet").trim(),
+      printA5:    Math.round(Number(r.printA5 ?? 0)),
+      grandTotal: gt,
+    };
+  });
+
+  return Response.json({ results });
 }
