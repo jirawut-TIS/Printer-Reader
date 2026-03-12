@@ -1,220 +1,104 @@
 /**
  * POST /api/extract
- * รับ base64 JPEG images (1–4 หน้า) → ส่ง Claude Vision → คืน JSON
- *
- * Body  : { images: string[], pageNums: number[] }
- * Return: { results: Array<{serial, model, printA5, grandTotal} | null> }
- *
- * กฎการอ่าน A5 ที่ถูกต้อง:
- *   - อ่านจาก PRINT section เท่านั้น (ไม่รวม Copy)
- *   - ใช้ค่าจาก Total column โดยตรง (ไม่ × Units 0.5)
- *   - Grand Total อ่านจาก Equivalent Impressions section
+ * รับ base64 JPEG image (1 หน้า) → Claude Vision → JSON
  */
-
-export const runtime    = "edge";
-export const maxDuration = 25;        // Vercel Hobby = 25s
+export const runtime     = "edge";
+export const maxDuration = 30;
 
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";
 const MODEL      = "claude-opus-4-6";
 
-/* ─── System Prompt ────────────────────────────────────────────────────────── */
 const SYSTEM = `You are a precise data extractor for HP Printer Usage Report pages.
-Each image is one scanned "Usage Page" from an HP printer.
+Each image is one scanned page. Extract exactly these 5 fields:
 
-Extract these 4 fields per page:
-
-════════════════════════════════
 1. serial — Product Serial Number
-════════════════════════════════
-Read from the "Device Information" section, line "Product Serial Number:".
+From "Device Information" -> "Product Serial Number:" line. Read EXACTLY what is printed.
+OCR rules for HP serials (always 10 uppercase chars):
+  CNBRS serials: chars 1-5=letters(CNBRS), chars 6-8=DIGITS(fix G->6,B->8,O->0,I->1), chars 9-10=as-printed
+  PHCBG serials: chars 1-5=letters(PHCBG), chars 6-10=all DIGITS(fix G->6,B->8,O->0,I->1)
+  Examples: CNBRS650GY CNBRS651F8 CNBRS650MB CNBRS6509F PHCBG29182 PHCBG31125
 
-⚠️ CRITICAL OCR RULES — common scan errors on HP serials:
-  • Digit "6" vs Letter "G" — HP serials use DIGIT "6", NEVER letter "G" inside the number portion.
-    ✅ CNBRS650GY  (digit 6, digit 5, digit 0, then letters GY at the END)
-    ❌ CNBRSG50GY  (wrong — G is not a digit here)
-    Rule: if you see what looks like "G" followed by digits, it is almost certainly digit "6".
-  • Digit "8" vs Letter "B" — ต้องดูจาก context ของ serial นั้นๆ
-    HP serials สามารถลงท้ายด้วยตัวอักษร B ได้จริง เช่น CNBRS650MB (M และ B เป็นตัวอักษร)
-    แต่กลางชุดตัวเลข (digits block) ถ้าเจอ B คือ digit 8
-    ✅ CNBRS651F8  — F8 ท้าย (8 คือ digit)
-    ✅ CNBRS650MB  — MB ท้าย (M และ B คือตัวอักษรจริง)
-    Rule: อ่านตามที่เห็นบนกระดาษ อย่า assume ว่า B ท้าย serial ต้องเป็น 8 เสมอ
-  • Digit "0" vs Letter "O" — read carefully from context.
-  • Digit "1" vs Letter "I" — read carefully from context.
-  Known serial patterns (10 chars, all uppercase):
-    PHCBG29182, PHCBG31125, PHCBG29972, PHCBG28280
-    CNBRS650GY, CNBRS651F8, CNBRS650K6, CNBRS6509F, CNBRS650MB, CNBRS650HQ
+2. model — Product Name from Device Information. Example: HP LaserJet M406, HP LaserJet MFP M430
 
-════════════════════════════════
-2. model — Product Name
-════════════════════════════════
-Examples: HP LaserJet M406, HP LaserJet MFP M430
+3. printA4 — INTEGER. From PRINT table only (inside "Impressions" section).
+  Find row "A4" or "A4 (210x297 mm)". Return rightmost Total column number. No math.
+  DO NOT use Copy table. No A4 row -> return 0.
 
-════════════════════════════════
-3. printA5 — A5 count from PRINT table only
-════════════════════════════════
-  • Look ONLY at the table under heading "Print" inside "Impressions" section.
-  • Find the row whose Paper Size column contains "A5" or "148x210".
-  • ⚠️ "Legal (8.5x14)" is NOT A5. "Letter (8.5x11)" is NOT A5. Only rows with "A5" or "148x210".
-  • Return the number in the rightmost "Total" column of the A5 row. DO NOT multiply or divide.
-  • DO NOT include A5 from the "Copy" table.
-  • If no A5 row exists in Print → return 0.
-  Examples:
-    Print row: "A5 (148x210mm) | 0.5 | 20,318"  → printA5 = 20318
-    Print row: "A5 (148x210 mm) | 0.5 | 8,307"  → printA5 = 8307
-    Print row: "Legal (8.5x14) | 1.3 | 146"      → printA5 = 0 (Legal is NOT A5)
-    No A5 row in Print table                      → printA5 = 0
+4. printA5 — INTEGER. From PRINT table only (inside "Impressions" section).
+  Find row containing "A5" or "148x210". Return rightmost Total column number. No math.
+  WARNING: "Legal (8.5x14)" is NOT A5. "Letter (8.5x11)" is NOT A5.
+  DO NOT use Copy table. No A5 row -> return 0.
 
-════════════════════════════════
-4. grandTotal — from Equivalent Impressions section
-════════════════════════════════
-  • Read ONLY from the section titled "Equivalent Impressions (Letter/A4)".
-  • That section has rows: Print, Copy, Fax, Grand Total.
-  • Read the "Grand Total" row value EXACTLY as printed — keep all decimals.
-  • ⚠️ DO NOT round. DO NOT truncate. DO NOT add .0 if not printed.
-    If printed as "60,519.5"  → grandTotal = 60519.5  (NOT 60520)
-    If printed as "143,225.5" → grandTotal = 143225.5 (NOT 143226)
-    If printed as "14,173.5"  → grandTotal = 14173.5  (NOT 14174)
-    If printed as "20,231.1"  → grandTotal = 20231.1  (NOT 20231 or 20232)
-    If printed as "71,142.0"  → grandTotal = 71142.0
-    If printed as "10,291.0"  → grandTotal = 10291.0
-  • DO NOT use values from "Scan Counts by Size", "Scan Counts by Destination",
-    or individual paper-size rows (Legal 146, A4 15965 etc.) as Grand Total.
-  • The Grand Total is always the LARGEST summary number in the Equivalent Impressions table.
+5. grandTotal — FLOAT. From "Equivalent Impressions (Letter/A4)" section ONLY.
+  Read "Grand Total" row value EXACTLY as printed. Keep all decimals.
+  60519.5 stays 60519.5, NOT 60520. 143225.5 stays 143225.5, NOT 143226.
+  NEVER use Scan Counts sections.
 
-════════════════════════════════
-Output format
-════════════════════════════════
-Return ONLY a valid JSON array, no markdown, no explanation:
-[
-  {"serial":"...","model":"...","printA5":0,"grandTotal":0.0},
-  ...
-]
-Array length MUST equal the number of images sent.
-Non-Usage pages → null:
-[null, {"serial":"...","model":"...","printA5":0,"grandTotal":0.0}]`;
+Return ONLY valid JSON array, no markdown:
+[{"serial":"...","model":"...","printA4":0,"printA5":0,"grandTotal":0.0}]
+Non-Usage page (blank/cover) -> return [null]`;
 
-/* ─── Edge handler ─────────────────────────────────────────────────────────── */
+const OCR_FIX  = { O:"0",I:"1",L:"1",B:"8",G:"6",S:"5",Z:"2" };
+const toDigit  = (c) => OCR_FIX[c] ?? c;
+function correctSerial(raw) {
+  const s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g,"");
+  if (s.length !== 10) return s;
+  const pre = s.slice(0,5), suf = s.slice(5);
+  if (/^PHC[A-Z]{2}$/.test(pre)) return pre + suf.split("").map(toDigit).join("");
+  if (/^CNB[A-Z]{2}$/.test(pre)) return pre + suf.slice(0,3).split("").map(toDigit).join("") + suf.slice(3);
+  return s;
+}
+
 export async function POST(req) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return Response.json({ error: "ANTHROPIC_API_KEY not set" }, { status: 500 });
-  }
+  if (!apiKey) return Response.json({ error:"ANTHROPIC_API_KEY not set" }, { status:500 });
 
   let body;
   try { body = await req.json(); }
-  catch { return Response.json({ error: "Invalid JSON body" }, { status: 400 }); }
+  catch { return Response.json({ error:"Invalid JSON" }, { status:400 }); }
 
   const { images, pageNums } = body;
-  if (!Array.isArray(images) || !images.length) {
-    return Response.json({ error: "images[] required" }, { status: 400 });
-  }
+  if (!Array.isArray(images) || !images.length)
+    return Response.json({ error:"images[] required" }, { status:400 });
 
-  /* Build message content — one text label + one image per page */
   const content = [];
-  images.forEach((b64, i) => {
-    content.push({ type: "text", text: `Page ${pageNums?.[i] ?? i + 1}:` });
-    content.push({
-      type:   "image",
-      source: { type: "base64", media_type: "image/jpeg", data: b64 },
-    });
+  images.forEach((b64,i) => {
+    content.push({ type:"text", text:`Page ${pageNums?.[i] ?? i+1}:` });
+    content.push({ type:"image", source:{ type:"base64", media_type:"image/jpeg", data:b64 } });
   });
-  content.push({
-    type: "text",
-    text: `Extract data from all ${images.length} page(s) above. Return a JSON array with exactly ${images.length} element(s).`,
-  });
+  content.push({ type:"text", text:`Extract from ${images.length} page(s). Return JSON array with exactly ${images.length} element(s).` });
 
-  /* Call Claude */
   const claudeRes = await fetch(CLAUDE_API, {
-    method:  "POST",
-    headers: {
-      "Content-Type":      "application/json",
-      "x-api-key":         apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model:      MODEL,
-      max_tokens: 1024,
-      system:     SYSTEM,
-      messages:   [{ role: "user", content }],
-    }),
+    method:"POST",
+    headers:{ "Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01" },
+    body: JSON.stringify({ model:MODEL, max_tokens:1024, system:SYSTEM, messages:[{ role:"user", content }] }),
   });
 
   if (!claudeRes.ok) {
-    console.error("Claude error:", await claudeRes.text());
-    return Response.json({ results: images.map(() => null) });
+    if (claudeRes.status===429 || claudeRes.status===529)
+      return new Response(JSON.stringify({error:"rate_limit"}), { status:429, headers:{"Content-Type":"application/json"} });
+    return Response.json({ results:images.map(()=>null) });
   }
 
   const data = await claudeRes.json();
   const raw  = data.content?.[0]?.text ?? "[]";
 
-  /* Parse JSON — strip markdown fences if present */
   let parsed;
-  try {
-    parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-  } catch {
-    console.error("JSON parse failed:", raw);
-    return Response.json({ results: images.map(() => null) });
-  }
+  try { parsed = JSON.parse(raw.replace(/```json|```/g,"").trim()); }
+  catch { return Response.json({ results:images.map(()=>null) }); }
 
-  /* Normalise & validate */
-  const arr = Array.isArray(parsed) ? parsed : images.map(() => null);
+  const arr = Array.isArray(parsed) ? parsed : images.map(()=>null);
   while (arr.length < images.length) arr.push(null);
 
-  /* ─── Programmatic Serial Correction ───────────────────────────────────────
-   * HP serial numbers follow strict patterns — we can fix OCR errors
-   * by knowing which positions must be digits vs letters.
-   *
-   * Known HP LaserJet patterns (10 chars):
-   *   PHCBG + 5 digits    e.g. PHCBG29182
-   *   CNBRS + 6 alphanum  e.g. CNBRS650GY, CNBRS651F8, CNBRS6509F
-   *
-   * Common OCR errors:
-   *   digit 6 ↔ letter G     digit 8 ↔ letter B
-   *   digit 0 ↔ letter O     digit 1 ↔ letter I / L
-   *   digit 5 ↔ letter S     digit 2 ↔ letter Z
-   ─────────────────────────────────────────────────────────────────────────── */
-  const CHAR_TO_DIGIT = { 'O':'0','I':'1','L':'1','B':'8','G':'6','S':'5','Z':'2','T':'7' };
-
-  function toDigit(c) { return CHAR_TO_DIGIT[c] ?? c; }
-
-  function correctSerial(raw) {
-    const s = raw.toUpperCase().replace(/\s/g, "").replace(/[^A-Z0-9]/g, "");
-    if (s.length !== 10) return s;
-
-    const prefix5 = s.slice(0, 5);  // first 5 chars — always letters, keep as-is
-    const rest    = s.slice(5);     // last 5 chars — mixed digits/letters
-
-    /* PHCBG____ : last 5 must ALL be digits */
-    if (/^PHC[A-Z]{2}$/.test(prefix5)) {
-      return prefix5 + rest.split("").map(toDigit).join("");
-    }
-
-    /* CNBRS____ :
-     *   pos 5,6,7 (rest[0..2]) → always digits  e.g. "650", "651"
-     *   pos 8,9   (rest[3..4]) → mixed           e.g. "GY","K6","F8","9F","M8","HQ"
-     *   → force-correct only the digit positions (0,1,2 of rest)
-     */
-    if (/^CNB[A-Z]{2}$/.test(prefix5)) {
-      const digits = rest.slice(0, 3).split("").map(toDigit).join("");  // pos5-7 must be digits
-      const tail   = rest.slice(3);                                      // pos8-9 keep as-is
-      return prefix5 + digits + tail;
-    }
-
-    return s;
-  }
-
-  const results = arr.slice(0, images.length).map((r) => {
+  const results = arr.slice(0,images.length).map((r) => {
     if (!r || !r.serial) return null;
-
-    const rawGT = String(r.grandTotal ?? "0").replace(/,/g, "");
-    const gt    = Math.floor(parseFloat(rawGT));  // ตัดทศนิยมออก ไม่ปัดขึ้น
-
+    const gt = Math.floor(parseFloat(String(r.grandTotal??"0").replace(/,/g,"")));
     return {
       serial:     correctSerial(String(r.serial).trim()),
-      model:      String(r.model ?? "HP LaserJet").trim(),
-      printA5:    Math.round(Number(r.printA5 ?? 0)),
-      grandTotal: gt,
+      model:      String(r.model??"HP LaserJet").trim(),
+      printA4:    Math.round(Number(r.printA4??0)),
+      printA5:    Math.round(Number(r.printA5??0)),
+      grandTotal: isNaN(gt) ? 0 : gt,
     };
   });
 

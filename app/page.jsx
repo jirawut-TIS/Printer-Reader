@@ -2,129 +2,154 @@
 import { useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 
-/* ─────────────────────────────────────────────
-   CONFIG  —  ปรับได้ถ้า Vercel timeout บ่อย
-   PAGES_PER_BATCH : หน้าต่อ 1 API call  (แนะนำ 4)
-   PARALLEL_CALLS  : calls พร้อมกัน       (แนะนำ 4)
-───────────────────────────────────────────── */
-const PAGES_PER_BATCH = 4;
-const PARALLEL_CALLS  = 6;   // เพิ่มจาก 4 → 6
+/* ══════════════════════════════════════════════════════
+   CONFIG  — ปรับตามความต้องการ
+   WORKERS  : จำนวน API calls พร้อมกัน (3 = ปลอดภัย, 5 = เร็วขึ้น)
+   SCALE    : ความละเอียดภาพ (1.5 = เร็ว, 2.0 = ชัดกว่า)
+══════════════════════════════════════════════════════ */
+const WORKERS = 4;
+const SCALE   = 1.6;
+const QUALITY = 0.75;
 
-/* ─── Styles (inline — no Tailwind needed) ── */
+/* ─── Styles ──────────────────────────────────────── */
 const S = {
-  page:      { fontFamily:"'Sarabun',sans-serif", background:"#0d1117", minHeight:"100vh", color:"#e6edf3" },
-  header:    { background:"#161b22", borderBottom:"1px solid #30363d", padding:"14px 24px", display:"flex", alignItems:"center", gap:12 },
-  hIcon:     { width:38, height:38, background:"linear-gradient(135deg,#38bdf8,#6366f1)", borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", fontSize:19, flexShrink:0 },
-  hTitle:    { fontSize:17, fontWeight:700 },
-  hSub:      { fontSize:12, color:"#8b949e", marginTop:2 },
-  hBadge:    { marginLeft:"auto", background:"#1e293b", border:"1px solid #38bdf8", color:"#38bdf8", fontSize:11, padding:"4px 12px", borderRadius:20, fontFamily:"monospace", whiteSpace:"nowrap" },
-  wrap:      { maxWidth:920, margin:"0 auto", padding:"28px 18px 64px" },
-  dropBase:  { borderRadius:12, padding:"38px 20px", textAlign:"center", cursor:"pointer", transition:"all .2s" },
-  btnRow:    { display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginTop:14 },
-  btn:       (active,color) => ({
+  page:     { fontFamily:"'Sarabun',sans-serif", background:"#0d1117", minHeight:"100vh", color:"#e6edf3" },
+  header:   { background:"#161b22", borderBottom:"1px solid #30363d", padding:"14px 24px", display:"flex", alignItems:"center", gap:12 },
+  hIcon:    { width:38, height:38, background:"linear-gradient(135deg,#38bdf8,#6366f1)", borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", fontSize:19, flexShrink:0 },
+  hTitle:   { fontSize:17, fontWeight:700 },
+  hSub:     { fontSize:12, color:"#8b949e", marginTop:2 },
+  hBadge:   { marginLeft:"auto", background:"#1e293b", border:"1px solid #38bdf8", color:"#38bdf8", fontSize:11, padding:"4px 12px", borderRadius:20, fontFamily:"monospace", whiteSpace:"nowrap" },
+  wrap:     { maxWidth:960, margin:"0 auto", padding:"28px 18px 64px" },
+  dropBase: { borderRadius:12, padding:"38px 20px", textAlign:"center", cursor:"pointer", transition:"all .2s" },
+  btnRow:   { display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginTop:14 },
+  btn:      (on,col) => ({
     padding:"13px 0", border:"none", borderRadius:9, fontSize:14, fontWeight:700,
-    cursor: active ? "pointer" : "not-allowed",
-    background: active ? color : "#1e293b",
-    color: active ? (color==="#38bdf8" ? "#0d1117" : "#fff") : "#4b5563",
+    cursor: on?"pointer":"not-allowed",
+    background: on ? col : "#1e293b",
+    color: on ? (col==="#38bdf8"?"#0d1117":"#fff") : "#4b5563",
     transition:"all .15s",
   }),
   progWrap:  { marginTop:20 },
   progLabel: { display:"flex", justifyContent:"space-between", fontSize:12, color:"#8b949e", marginBottom:6 },
-  progBg:    { height:6, background:"#1e293b", borderRadius:3, overflow:"hidden" },
-  progFill:  (pct) => ({ height:"100%", width:`${pct}%`, background:"linear-gradient(90deg,#38bdf8,#6366f1)", borderRadius:3, transition:"width .3s" }),
+  progBg:    { height:8, background:"#1e293b", borderRadius:4, overflow:"hidden" },
+  progFill:  (p) => ({ height:"100%", width:`${p}%`, background:"linear-gradient(90deg,#38bdf8,#6366f1)", borderRadius:4, transition:"width .4s" }),
   progMsg:   { fontSize:11, color:"#4b5563", marginTop:5, fontFamily:"monospace" },
-  alert:     (type) => ({
+  alert:     (t) => ({
     marginTop:14, padding:"11px 16px", borderRadius:8, fontSize:13, display:"flex", gap:8, alignItems:"flex-start", lineHeight:1.6,
-    background: type==="ok" ? "rgba(63,185,80,.1)" : type==="err" ? "rgba(248,81,73,.1)" : "rgba(56,189,248,.1)",
-    border: `1px solid ${type==="ok" ? "#3fb950" : type==="err" ? "#f85149" : "#38bdf8"}`,
-    color: type==="ok" ? "#7ee787" : type==="err" ? "#fca5a5" : "#7dd3fc",
+    background: t==="ok"?"rgba(63,185,80,.1)":t==="err"?"rgba(248,81,73,.1)":"rgba(56,189,248,.1)",
+    border:`1px solid ${t==="ok"?"#3fb950":t==="err"?"#f85149":"#38bdf8"}`,
+    color: t==="ok"?"#7ee787":t==="err"?"#fca5a5":"#7dd3fc",
   }),
-  stats:     { display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginTop:20 },
-  statCard:  { background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:"14px 18px", textAlign:"center" },
-  statVal:   { fontSize:26, fontWeight:800, color:"#38bdf8", fontFamily:"monospace", letterSpacing:-1 },
-  statLbl:   { fontSize:11, color:"#8b949e", marginTop:4 },
-  tableWrap: { marginTop:20, background:"#161b22", border:"1px solid #30363d", borderRadius:12, overflow:"hidden" },
-  tableHead: { padding:"12px 18px", borderBottom:"1px solid #30363d", display:"flex", alignItems:"center", justifyContent:"space-between" },
-  tBadge:    { fontSize:11, background:"#0d1117", border:"1px solid #30363d", borderRadius:20, padding:"3px 10px", color:"#8b949e", fontFamily:"monospace" },
-  th:        (right) => ({ padding:"9px 14px", textAlign:right?"right":"left", fontSize:11, fontWeight:700, textTransform:"uppercase", letterSpacing:".5px", color:"#8b949e", whiteSpace:"nowrap", borderBottom:"1px solid #30363d" }),
-  td:        (right,color) => ({ padding:"10px 14px", textAlign:right?"right":"left", color: color||"#e6edf3", fontFamily:"monospace", fontSize:13 }),
-  tfootRow:  { background:"#0d1117", borderTop:"1px solid #30363d" },
-  footer:    { marginTop:32, textAlign:"center", fontSize:11, color:"#30363d" },
+  stats:    { display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginTop:20 },
+  statCard: { background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:"14px 18px", textAlign:"center" },
+  statVal:  { fontSize:22, fontWeight:800, color:"#38bdf8", fontFamily:"monospace", letterSpacing:-1 },
+  statLbl:  { fontSize:11, color:"#8b949e", marginTop:4 },
+  tWrap:    { marginTop:20, background:"#161b22", border:"1px solid #30363d", borderRadius:12, overflow:"hidden" },
+  tHead:    { padding:"12px 18px", borderBottom:"1px solid #30363d", display:"flex", alignItems:"center", justifyContent:"space-between" },
+  tBadge:   { fontSize:11, background:"#0d1117", border:"1px solid #30363d", borderRadius:20, padding:"3px 10px", color:"#8b949e", fontFamily:"monospace" },
+  th:       (r) => ({ padding:"9px 14px", textAlign:r?"right":"left", fontSize:11, fontWeight:700, textTransform:"uppercase", letterSpacing:".5px", color:"#8b949e", whiteSpace:"nowrap", borderBottom:"1px solid #30363d" }),
+  td:       (r,c) => ({ padding:"10px 14px", textAlign:r?"right":"left", color:c||"#e6edf3", fontFamily:"monospace", fontSize:13 }),
+  tfootRow: { background:"#0d1117", borderTop:"2px solid #30363d" },
+  footer:   { marginTop:32, textAlign:"center", fontSize:11, color:"#30363d" },
 };
 
-/* ─── Number formatters ── */
-const fmt = (n) =>
-  typeof n === "number"
-    ? n.toLocaleString("en-US", { minimumFractionDigits:0, maximumFractionDigits:1 })
-    : "—";
+const fmt   = (n) => typeof n==="number" ? Math.floor(n).toLocaleString("en-US") : "—";
+const fmtA5 = (n) => typeof n==="number" ? n.toLocaleString("en-US") : "—";
 
-// Grand Total แสดงเป็นจำนวนเต็ม ไม่ปัดขึ้น
-const fmtGT = (n) =>
-  typeof n === "number"
-    ? Math.floor(n).toLocaleString("en-US")
-    : "—";
-
-/* ════════════════════════════════════════════
+/* ══════════════════════════════════════════════════════
    MAIN COMPONENT
-════════════════════════════════════════════ */
+══════════════════════════════════════════════════════ */
 export default function Home() {
-  const [file,      setFile]      = useState(null);
-  const [status,    setStatus]    = useState("idle");   // idle|loading|done|error
-  const [pct,       setPct]       = useState(0);
-  const [msg,       setMsg]       = useState("");
-  const [rows,      setRows]      = useState([]);
-  const [errMsg,    setErrMsg]    = useState("");
-  // ── สถานที่และวันที่ ──
-  const [location,  setLocation]  = useState("");
-  const [reportDate, setReportDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const inputRef = useRef(null);
+  const [file,       setFile]       = useState(null);
+  const [status,     setStatus]     = useState("idle");
+  const [pct,        setPct]        = useState(0);
+  const [msg,        setMsg]        = useState("");
+  const [rows,       setRows]       = useState([]);
+  const [liveCount,  setLiveCount]  = useState(0);
+  const [errMsg,     setErrMsg]     = useState("");
+  const [location,   setLocation]   = useState("");
+  const [reportDate, setReportDate] = useState(() => new Date().toISOString().slice(0,10));
+  const inputRef     = useRef(null);
+  const abortRef     = useRef(false);      // สำหรับ cancel
+  const rlUntilRef   = useRef(0);          // rate-limit cooldown timestamp
 
-  /* ── File handler ── */
+  /* ── totals ── */
+  const totalA4    = rows.reduce((s,r) => s + (r.printA4||0), 0);
+  const totalA5    = rows.reduce((s,r) => s + (r.printA5||0), 0);
+  const totalGrand = rows.reduce((s,r) => s + (r.grandTotal||0), 0);
+
+  /* ── file pick ── */
   const pickFile = (f) => {
     if (!f || f.type !== "application/pdf") return;
-    setFile(f); setRows([]); setStatus("idle"); setErrMsg("");
+    setFile(f); setRows([]); setStatus("idle"); setErrMsg(""); setLiveCount(0);
   };
 
-  /* ── Convert 1 PDF page → base64 JPEG (cropped to top 55%) ── */
+  /* ── render 1 page → base64 JPEG ── */
   const toBase64 = useCallback(async (pdfDoc, pageNum) => {
     const page   = await pdfDoc.getPage(pageNum);
-    const vp     = page.getViewport({ scale: 1.8 });
-
-    // Render full page ก่อน
-    const full        = document.createElement("canvas");
-    full.width        = vp.width;
-    full.height       = vp.height;
-    await page.render({ canvasContext: full.getContext("2d"), viewport: vp }).promise;
-
-    // Crop เฉพาะส่วนบน 55% — ครอบคลุม Device Info + Impressions + Equivalent Impressions
-    // ตัด Scan Counts by Size / Destination ด้านล่างออก (ไม่ใช้)
-    const cropH  = Math.floor(vp.height * 0.55);
-    const out    = document.createElement("canvas");
-    out.width    = vp.width;
-    out.height   = cropH;
-    out.getContext("2d").drawImage(full, 0, 0, vp.width, cropH, 0, 0, vp.width, cropH);
-
-    return out.toDataURL("image/jpeg", 0.75).split(",")[1];
+    const vp     = page.getViewport({ scale: SCALE });
+    const canvas = document.createElement("canvas");
+    canvas.width  = vp.width;
+    canvas.height = vp.height;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    return canvas.toDataURL("image/jpeg", QUALITY).split(",")[1];
   }, []);
 
-  /* ── Call /api/extract with a batch of images ── */
-  const callAPI = useCallback(async (images, pageNums) => {
-    const res = await fetch("/api/extract", {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ images, pageNums }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+  /* ── call API 1 page, exponential backoff on 429 ── */
+  const callOne = useCallback(async (image, pageNum) => {
+    const MAX = 6;
+    for (let attempt = 0; attempt < MAX; attempt++) {
+      if (abortRef.current) return null;
+
+      /* รอ global rate-limit cooldown */
+      const now = Date.now();
+      if (now < rlUntilRef.current) {
+        await new Promise(r => setTimeout(r, rlUntilRef.current - now + 200));
+      }
+
+      /* exponential backoff ก่อน retry */
+      if (attempt > 0) {
+        await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt-1), 30000)));
+      }
+
+      try {
+        const res = await fetch("/api/extract", {
+          method:  "POST",
+          headers: { "Content-Type":"application/json" },
+          body:    JSON.stringify({ images:[image], pageNums:[pageNum] }),
+        });
+
+        if (res.status === 429) {
+          /* rate limit — set global cooldown 20s ให้ทุก worker รอ */
+          rlUntilRef.current = Date.now() + 20000;
+          continue;
+        }
+        if (!res.ok) continue;
+
+        const data = await res.json();
+        const item = data.results?.[0];
+        if (item) return item;
+
+        /* Claude คืน null = ไม่ใช่ Usage Page → ไม่ต้อง retry */
+        return null;
+
+      } catch (_) { /* network error → retry */ }
+    }
+    return null;
   }, []);
 
-  /* ── MAIN: Read PDF ── */
+  /* ══════════════════════════════════════════════════
+     WORKER POOL — หัวใจของระบบ
+     สร้าง WORKERS workers ที่แย่งกันดึงหน้าจาก queue
+     ไม่มีการรอ "ทั้ง group" — ทุก worker ทำงานตลอดเวลา
+  ══════════════════════════════════════════════════ */
   const handleRead = async () => {
     if (!file) return;
     setStatus("loading"); setPct(0); setRows([]); setErrMsg("");
+    setLiveCount(0); abortRef.current = false; rlUntilRef.current = 0;
 
     try {
-      /* Load PDF.js from CDN — ไม่ต้อง install npm package จึงไม่มี canvas error */
+      /* โหลด PDF.js จาก CDN */
       if (!window.pdfjsLib) {
         await new Promise((resolve, reject) => {
           const s = document.createElement("script");
@@ -133,92 +158,64 @@ export default function Home() {
           document.head.appendChild(s);
         });
       }
-      const pdfjs = window.pdfjsLib;
-      pdfjs.GlobalWorkerOptions.workerSrc =
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
         "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
-      const pdfDoc  = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
-      const total   = pdfDoc.numPages;
-      setMsg(`พบ ${total} หน้า — กำลังเตรียม...`);
+      const pdfDoc = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+      const total  = pdfDoc.numPages;
+      setMsg(`พบ ${total} หน้า — เริ่มประมวลผลด้วย ${WORKERS} workers...`);
 
-      /* Split into batches */
-      const allPages = Array.from({ length: total }, (_, i) => i + 1);
-      const batches  = [];
-      for (let i = 0; i < allPages.length; i += PAGES_PER_BATCH)
-        batches.push(allPages.slice(i, i + PAGES_PER_BATCH));
+      /* ── Shared state (ใช้ closure refs ไม่ใช่ React state เพื่อความเร็ว) ── */
+      const queue      = Array.from({ length: total }, (_, i) => i + 1); // [1..N]
+      const collected  = [];    // ผลที่ได้
+      let   processed  = 0;     // หน้าที่ประมวลผลแล้ว
 
-      /* Split batches into groups */
-      const groups = [];
-      for (let i = 0; i < batches.length; i += PARALLEL_CALLS)
-        groups.push(batches.slice(i, i + PARALLEL_CALLS));
+      /* ── Worker function ── */
+      const worker = async (workerId) => {
+        while (queue.length > 0 && !abortRef.current) {
+          const pageNum = queue.shift();
+          if (pageNum === undefined) break;
 
-      let done = 0;
-      const collected = [];
+          try {
+            /* render + API */
+            const img  = await toBase64(pdfDoc, pageNum);
+            const item = await callOne(img, pageNum);
+            if (item) {
+              collected.push(item);
+              setLiveCount(collected.length);
 
-      /* ── PIPELINE: render group[N+1] ขณะที่ API กำลัง process group[N] ── */
-      const renderGroup = (group) =>
-        Promise.all(
-          group.map(async (batch) => ({
-            pageNums: batch,
-            images:   await Promise.all(batch.map((p) => toBase64(pdfDoc, p))),
-          }))
-        );
+              /* live table update ทุก 3 เครื่อง */
+              if (collected.length % 3 === 0 || collected.length <= 5) {
+                const map = buildMap(collected);
+                setRows([...map.values()]);
+              }
+            }
+          } catch (_) { /* individual page error — skip */ }
 
-      // pre-render กลุ่มแรกก่อนเลย
-      let nextRenderPromise = renderGroup(groups[0]);
-
-      for (let g = 0; g < groups.length; g++) {
-        const group = groups[g];
-        setMsg(`🖼️ แปลงหน้า ${done + 1}–${Math.min(done + group.flat().length, total)} / ${total}...`);
-
-        // รอ render กลุ่มนี้เสร็จ
-        const rendered = await nextRenderPromise;
-
-        // เริ่ม render กลุ่มถัดไปทันที (parallel กับ API call)
-        if (g + 1 < groups.length) {
-          nextRenderPromise = renderGroup(groups[g + 1]);
+          processed++;
+          setPct(Math.round((processed / total) * 100));
+          setMsg(`⚡ Worker${workerId}: หน้า ${pageNum}/${total} — พบ ${collected.length} เครื่องพิมพ์`);
         }
+      };
 
-        setMsg(`⚡ AI วิเคราะห์ ${rendered.length} กลุ่มพร้อมกัน (หน้า ${done + 1}–${Math.min(done + group.flat().length, total)})...`);
+      /* ── เริ่ม WORKERS workers พร้อมกัน ── */
+      await Promise.all(Array.from({ length: WORKERS }, (_, i) => worker(i + 1)));
 
-        /* Call API concurrently */
-        const responses = await Promise.all(
-          rendered.map(({ images, pageNums }) =>
-            callAPI(images, pageNums).catch(() => ({ results: pageNums.map(() => null) }))
-          )
-        );
-
-        responses.forEach((r) => r.results?.forEach((item) => { if (item) collected.push(item); }));
-        done += group.flat().length;
-        setPct(Math.round((done / total) * 100));
-      }
-
-      /* Aggregate by serial number */
-      const map = new Map();
-      collected.forEach((r) => {
-        if (map.has(r.serial)) {
-          const e = map.get(r.serial);
-          e.printA5    += r.printA5    ?? 0;
-          e.grandTotal  = e.grandTotal + (r.grandTotal ?? 0);
-        } else {
-          map.set(r.serial, {
-            ...r,
-            printA5:    r.printA5    ?? 0,
-            grandTotal: r.grandTotal ?? 0,
-          });
-        }
-      });
-
+      /* ── Final aggregation ── */
+      const map   = buildMap(collected);
       const final = [...map.values()];
 
+      setRows(final);
+      setPct(100);
+
       if (!final.length) {
-        setErrMsg("ไม่พบข้อมูลเครื่องพิมพ์ กรุณาตรวจสอบว่าเป็น HP Printer Usage Report PDF");
-        setStatus("error"); return;
+        setErrMsg("ไม่พบข้อมูลเครื่องพิมพ์ กรุณาตรวจสอบว่าเป็น HP Printer Usage Report");
+        setStatus("error");
+      } else {
+        setStatus("done");
+        setMsg(`✅ เสร็จสิ้น — อ่านครบ ${total} หน้า พบ ${final.length} เครื่องพิมพ์`);
       }
 
-      setRows(final);
-      setStatus("done");
-      setMsg(`✅ เสร็จสิ้น อ่านได้ ${final.length} เครื่อง จาก ${total} หน้า`);
     } catch (err) {
       console.error(err);
       setErrMsg("เกิดข้อผิดพลาด: " + err.message);
@@ -226,79 +223,75 @@ export default function Home() {
     }
   };
 
+  /* ── หยุดการทำงาน ── */
+  const handleStop = () => { abortRef.current = true; };
+
+  /* ── Aggregate collected → Map by serial ── */
+  function buildMap(collected) {
+    const map = new Map();
+    collected.forEach((r) => {
+      if (map.has(r.serial)) {
+        const e = map.get(r.serial);
+        e.printA4    += r.printA4    || 0;
+        e.printA5    += r.printA5    || 0;
+        e.grandTotal += r.grandTotal || 0;
+      } else {
+        map.set(r.serial, { ...r, printA4: r.printA4||0, printA5: r.printA5||0, grandTotal: r.grandTotal||0 });
+      }
+    });
+    return map;
+  }
+
   /* ── Export Excel ── */
   const handleExport = () => {
     if (!rows.length) return;
 
-    // แปลงวันที่เป็น พ.ศ. แบบไทย
-    const dateObj = reportDate ? new Date(reportDate) : new Date();
-    const thaiDate = `${dateObj.getDate().toString().padStart(2,"0")}/${(dateObj.getMonth()+1).toString().padStart(2,"0")}/${dateObj.getFullYear()+543}`;
+    const BE_YEAR = new Date(reportDate).getFullYear() + 543;
+    const dateStr = new Date(reportDate).toLocaleDateString("th-TH", { year:"numeric", month:"long", day:"numeric" });
 
-    // Header rows
-    const header = [
+    const ws = XLSX.utils.aoa_to_sheet([
       ["รายงานการใช้งานเครื่องพิมพ์"],
       ["สถานที่", location || "-"],
-      ["วันที่", thaiDate],
+      ["วันที่",  `${dateStr} (พ.ศ. ${BE_YEAR})`],
       [],
-      ["#", "Serial", "Model", "Print A5 (หน้าจริง)", "Grand Total (A4)"],
-    ];
-
-    const data = rows.map((r, i) => [
-      i + 1,
-      r.serial,
-      r.model,
-      r.printA5,
-      r.grandTotal,
-    ]);
-    data.push([
-      "รวม", "", "",
-      rows.reduce((s, r) => s + r.printA5, 0),
-      rows.reduce((s, r) => s + r.grandTotal, 0),
+      ["#", "Serial Number", "รุ่นเครื่องพิมพ์", "A4 Print", "A5 Print", "Grand Total (A4)"],
+      ...rows.map((r, i) => [i+1, r.serial, r.model, r.printA4||0, r.printA5||0, r.grandTotal||0]),
+      [],
+      ["รวม", "", "", totalA4, totalA5, totalGrand],
     ]);
 
-    const ws = XLSX.utils.aoa_to_sheet([...header, ...data]);
-
-    // column widths
-    ws["!cols"] = [{ wch:5 }, { wch:16 }, { wch:24 }, { wch:20 }, { wch:20 }];
-
-    // merge title cell A1
-    ws["!merges"] = [{ s:{ r:0, c:0 }, e:{ r:0, c:4 } }];
+    /* column widths */
+    ws["!cols"] = [{ wch:5 },{ wch:15 },{ wch:22 },{ wch:12 },{ wch:12 },{ wch:16 }];
 
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Printer Usage");
-    XLSX.writeFile(wb, `printer-usage-${reportDate || new Date().toISOString().slice(0,10)}.xlsx`);
+    const fname = `printer_report_${location||"export"}_${reportDate}.xlsx`;
+    XLSX.writeFile(wb, fname);
   };
 
-  /* ── Derived totals ── */
-  const totalA5    = rows.reduce((s, r) => s + r.printA5,    0);
-  const totalGrand = rows.reduce((s, r) => s + r.grandTotal, 0);
-
-  /* ════════════ RENDER ════════════ */
+  /* ══════════════════════════════════════════════════
+     RENDER
+  ══════════════════════════════════════════════════ */
   return (
     <div style={S.page}>
-
-      {/* ── Header ── */}
+      {/* Header */}
       <div style={S.header}>
         <div style={S.hIcon}>🖨️</div>
         <div>
           <div style={S.hTitle}>Printer Usage Reader</div>
-          <div style={S.hSub}>อ่านค่าจาก HP Printer Report PDF · รองรับ 200+ หน้า</div>
+          <div style={S.hSub}>HP Printer Usage Report · Worker Pool · Claude Vision</div>
         </div>
-        <div style={S.hBadge}>⚡ Parallel · Claude Vision</div>
+        <div style={S.hBadge}>⚡ {WORKERS} Workers Parallel</div>
       </div>
 
       <div style={S.wrap}>
 
-        {/* ── Drop zone ── */}
+        {/* Drop zone */}
         <div
           onClick={() => inputRef.current?.click()}
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => { e.preventDefault(); pickFile(e.dataTransfer.files[0]); }}
-          style={{
-            ...S.dropBase,
-            border: `2px dashed ${file ? "#38bdf8" : "#30363d"}`,
-            background: file ? "rgba(56,189,248,.04)" : "#161b22",
-          }}
+          style={{ ...S.dropBase, border:`2px dashed ${file?"#38bdf8":"#30363d"}`, background:file?"rgba(56,189,248,.04)":"#161b22" }}
         >
           <input ref={inputRef} type="file" accept=".pdf" style={{ display:"none" }}
             onChange={(e) => pickFile(e.target.files[0])} />
@@ -308,89 +301,71 @@ export default function Home() {
           </div>
           <div style={{ fontSize:12, color:"#8b949e", marginTop:5 }}>
             {file
-              ? `${(file.size/1024).toFixed(1)} KB · คลิกเพื่อเปลี่ยนไฟล์`
-              : "รองรับ HP Printer Usage Report PDF · ไม่มีการอัปโหลดไฟล์ขึ้น server"}
+              ? `${(file.size/1024/1024).toFixed(1)} MB · คลิกเพื่อเปลี่ยนไฟล์`
+              : "รองรับ HP Printer Usage Report PDF 1–300+ หน้า · ประมวลผลในเบราว์เซอร์"}
           </div>
         </div>
 
-        {/* ── สถานที่ + วันที่ ── */}
+        {/* สถานที่ + วันที่ */}
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginTop:14 }}>
           <div>
             <label style={{ fontSize:12, color:"#8b949e", display:"block", marginBottom:5 }}>📍 สถานที่</label>
-            <input
-              type="text"
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
+            <input type="text" value={location} onChange={(e) => setLocation(e.target.value)}
               placeholder="เช่น สำนักงานใหญ่ กรุงเทพฯ"
-              style={{
-                width:"100%", padding:"10px 14px", borderRadius:8, fontSize:14,
-                background:"#161b22", border:"1px solid #30363d", color:"#e6edf3",
-                outline:"none", fontFamily:"'Sarabun',sans-serif",
-              }}
+              style={{ width:"100%", padding:"10px 14px", borderRadius:8, fontSize:14, background:"#161b22", border:"1px solid #30363d", color:"#e6edf3", outline:"none", fontFamily:"'Sarabun',sans-serif", boxSizing:"border-box" }}
             />
           </div>
           <div>
             <label style={{ fontSize:12, color:"#8b949e", display:"block", marginBottom:5 }}>📅 วันที่</label>
-            <input
-              type="date"
-              value={reportDate}
-              onChange={(e) => setReportDate(e.target.value)}
-              style={{
-                width:"100%", padding:"10px 14px", borderRadius:8, fontSize:14,
-                background:"#161b22", border:"1px solid #30363d", color:"#e6edf3",
-                outline:"none", fontFamily:"'Sarabun',sans-serif", colorScheme:"dark",
-              }}
+            <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
+              style={{ width:"100%", padding:"10px 14px", borderRadius:8, fontSize:14, background:"#161b22", border:"1px solid #30363d", color:"#e6edf3", outline:"none", colorScheme:"dark", boxSizing:"border-box" }}
             />
           </div>
         </div>
 
-        {/* ── Buttons ── */}
+        {/* Buttons */}
         <div style={S.btnRow}>
-          <button
-            onClick={handleRead}
-            disabled={!file || status === "loading"}
-            style={S.btn(!file || status==="loading" ? false : true, "#38bdf8")}
-          >
-            {status === "loading" ? "⏳ กำลังอ่าน..." : "🔍 อ่านข้อมูล"}
-          </button>
-          <button
-            onClick={handleExport}
-            disabled={!rows.length}
-            style={S.btn(rows.length > 0, "#166534")}
-          >
+          {status === "loading" ? (
+            <button onClick={handleStop}
+              style={{ ...S.btn(true,"#dc2626"), gridColumn:"1" }}>
+              ⏹ หยุด
+            </button>
+          ) : (
+            <button onClick={handleRead} disabled={!file}
+              style={S.btn(!!file, "#38bdf8")}>
+              🔍 อ่านข้อมูล
+            </button>
+          )}
+          <button onClick={handleExport} disabled={!rows.length}
+            style={S.btn(rows.length>0, "#166534")}>
             📊 Export Excel
           </button>
         </div>
 
-        {/* ── Progress ── */}
+        {/* Progress */}
         {status === "loading" && (
           <div style={S.progWrap}>
             <div style={S.progLabel}>
-              <span>Parallel {PARALLEL_CALLS}×{PAGES_PER_BATCH} หน้า/รอบ</span>
+              <span>⚡ {WORKERS} Workers · พบ {liveCount} เครื่องพิมพ์</span>
               <span>{pct}%</span>
             </div>
-            <div style={S.progBg}>
-              <div style={S.progFill(pct)} />
-            </div>
+            <div style={S.progBg}><div style={S.progFill(pct)} /></div>
             <div style={S.progMsg}>{msg}</div>
           </div>
         )}
 
-        {/* ── Alerts ── */}
-        {status === "error" && (
-          <div style={S.alert("err")}>❌ {errMsg}</div>
-        )}
-        {status === "done" && (
-          <div style={S.alert("ok")}>✅ {msg}</div>
-        )}
+        {/* Alert */}
+        {status === "error" && <div style={S.alert("err")}>❌ {errMsg}</div>}
+        {status === "done"  && <div style={S.alert("ok")}>✅ {msg}</div>}
 
-        {/* ── Stats ── */}
+        {/* Live stats */}
         {rows.length > 0 && (
           <div style={S.stats}>
             {[
-              { lbl: "เครื่องทั้งหมด",          val: rows.length   },
-              { lbl: "Grand Total รวม (A4)",     val: fmtGT(totalGrand) },
-              { lbl: "Print A5 รวม (หน้าจริง)", val: fmt(totalA5)    },
+              { lbl:"เครื่องทั้งหมด",        val: rows.length        },
+              { lbl:"A4 Print รวม",           val: fmt(totalA4)       },
+              { lbl:"A5 Print รวม (หน้าจริง)",val: fmtA5(totalA5)     },
+              { lbl:"Grand Total รวม (A4)",   val: fmt(totalGrand)    },
             ].map((s) => (
               <div key={s.lbl} style={S.statCard}>
                 <div style={S.statVal}>{s.val}</div>
@@ -400,11 +375,13 @@ export default function Home() {
           </div>
         )}
 
-        {/* ── Table ── */}
+        {/* Live Table */}
         {rows.length > 0 && (
-          <div style={S.tableWrap}>
-            <div style={S.tableHead}>
-              <span style={{ fontSize:14, fontWeight:700 }}>ผลการอ่านข้อมูล</span>
+          <div style={S.tWrap}>
+            <div style={S.tHead}>
+              <span style={{ fontSize:14, fontWeight:700 }}>ผลการอ่านข้อมูล
+                {status==="loading" && <span style={{ fontSize:11, color:"#38bdf8", marginLeft:8 }}>● กำลังอ่าน...</span>}
+              </span>
               <span style={S.tBadge}>{rows.length} เครื่อง</span>
             </div>
             <div style={{ overflowX:"auto" }}>
@@ -414,46 +391,49 @@ export default function Home() {
                     <th style={S.th(false)}>#</th>
                     <th style={S.th(false)}>Serial</th>
                     <th style={S.th(false)}>Model</th>
-                    <th style={S.th(true)}>Print A5 (หน้าจริง)</th>
+                    <th style={S.th(true)}>A4 Print</th>
+                    <th style={S.th(true)}>A5 Print</th>
                     <th style={S.th(true)}>Grand Total (A4)</th>
                   </tr>
                 </thead>
                 <tbody>
                   {rows.map((r, i) => (
                     <tr key={r.serial} style={{ borderBottom:"1px solid #1c2128" }}>
-                      <td style={S.td(false, "#8b949e")}>{i+1}</td>
-                      <td style={{ ...S.td(false, "#7dd3fc"), fontWeight:600 }}>{r.serial}</td>
-                      <td style={{ ...S.td(false, "#8b949e"), fontFamily:"'Sarabun',sans-serif", fontSize:13 }}>{r.model}</td>
-                      <td style={{ ...S.td(true, r.printA5 > 0 ? "#fbbf24" : "#4b5563"), fontWeight: r.printA5>0?700:400 }}>
-                        {fmt(r.printA5)}
+                      <td style={S.td(false,"#8b949e")}>{i+1}</td>
+                      <td style={{ ...S.td(false,"#7dd3fc"), fontWeight:600 }}>{r.serial}</td>
+                      <td style={{ ...S.td(false,"#8b949e"), fontFamily:"'Sarabun',sans-serif", fontSize:13 }}>{r.model}</td>
+                      <td style={{ ...S.td(true, r.printA4>0?"#60a5fa":"#4b5563"), fontWeight:r.printA4>0?700:400 }}>
+                        {fmt(r.printA4)}
                       </td>
-                      <td style={{ ...S.td(true), fontWeight:700 }}>{fmtGT(r.grandTotal)}</td>
+                      <td style={{ ...S.td(true, r.printA5>0?"#fbbf24":"#4b5563"), fontWeight:r.printA5>0?700:400 }}>
+                        {fmtA5(r.printA5)}
+                      </td>
+                      <td style={{ ...S.td(true), fontWeight:700 }}>{fmt(r.grandTotal)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot>
                   <tr style={S.tfootRow}>
-                    <td colSpan={3} style={{ ...S.td(true, "#8b949e"), fontSize:12 }}>รวม</td>
-                    <td style={{ ...S.td(true, "#fbbf24"), fontWeight:800 }}>{fmt(totalA5)}</td>
-                    <td style={{ ...S.td(true, "#38bdf8"), fontWeight:800 }}>{fmtGT(totalGrand)}</td>
+                    <td colSpan={3} style={{ ...S.td(true,"#8b949e"), fontSize:12 }}>รวม</td>
+                    <td style={{ ...S.td(true,"#60a5fa"), fontWeight:800 }}>{fmt(totalA4)}</td>
+                    <td style={{ ...S.td(true,"#fbbf24"), fontWeight:800 }}>{fmtA5(totalA5)}</td>
+                    <td style={{ ...S.td(true,"#38bdf8"), fontWeight:800 }}>{fmt(totalGrand)}</td>
                   </tr>
                 </tfoot>
               </table>
             </div>
-          {/* ── แสดง สถานที่ + วันที่ ใต้ตาราง ── */}
-          {(location || reportDate) && (
-            <div style={{ padding:"10px 18px", borderTop:"1px solid #30363d", display:"flex", gap:24, fontSize:13, color:"#8b949e" }}>
-              {location   && <span>📍 {location}</span>}
-              {reportDate && <span>📅 {new Date(reportDate).toLocaleDateString("th-TH",{ year:"numeric", month:"long", day:"numeric" })}</span>}
-            </div>
-          )}
+            {(location || reportDate) && (
+              <div style={{ padding:"10px 18px", borderTop:"1px solid #30363d", display:"flex", gap:24, fontSize:13, color:"#8b949e" }}>
+                {location   && <span>📍 {location}</span>}
+                {reportDate && <span>📅 {new Date(reportDate).toLocaleDateString("th-TH",{ year:"numeric", month:"long", day:"numeric" })}</span>}
+              </div>
+            )}
           </div>
         )}
 
         <div style={S.footer}>
-          Printer Usage Reader v2.1 · ไฟล์ PDF ประมวลผลในเบราว์เซอร์ · ไม่มีการอัปโหลดขึ้น server
+          Printer Usage Reader v3.0 · Worker Pool · ประมวลผลในเบราว์เซอร์ · ไม่อัปโหลดไฟล์ขึ้น server
         </div>
-
       </div>
     </div>
   );
