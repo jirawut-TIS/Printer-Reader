@@ -85,15 +85,26 @@ export default function Home() {
     setFile(f); setRows([]); setStatus("idle"); setErrMsg("");
   };
 
-  /* ── Convert 1 PDF page → base64 JPEG ── */
+  /* ── Convert 1 PDF page → base64 JPEG (cropped to top 55%) ── */
   const toBase64 = useCallback(async (pdfDoc, pageNum) => {
     const page   = await pdfDoc.getPage(pageNum);
-    const vp     = page.getViewport({ scale: 1.8 });   // ลดจาก 2.2 → 1.8 (เร็วขึ้น ~35%)
-    const canvas = document.createElement("canvas");
-    canvas.width  = vp.width;
-    canvas.height = vp.height;
-    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
-    return canvas.toDataURL("image/jpeg", 0.75).split(",")[1]; // quality 0.9 → 0.75 (เร็วขึ้น ~20%)
+    const vp     = page.getViewport({ scale: 1.8 });
+
+    // Render full page ก่อน
+    const full        = document.createElement("canvas");
+    full.width        = vp.width;
+    full.height       = vp.height;
+    await page.render({ canvasContext: full.getContext("2d"), viewport: vp }).promise;
+
+    // Crop เฉพาะส่วนบน 55% — ครอบคลุม Device Info + Impressions + Equivalent Impressions
+    // ตัด Scan Counts by Size / Destination ด้านล่างออก (ไม่ใช้)
+    const cropH  = Math.floor(vp.height * 0.55);
+    const out    = document.createElement("canvas");
+    out.width    = vp.width;
+    out.height   = cropH;
+    out.getContext("2d").drawImage(full, 0, 0, vp.width, cropH, 0, 0, vp.width, cropH);
+
+    return out.toDataURL("image/jpeg", 0.75).split(",")[1];
   }, []);
 
   /* ── Call /api/extract with a batch of images ── */

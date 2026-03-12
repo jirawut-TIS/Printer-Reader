@@ -33,9 +33,12 @@ Read from the "Device Information" section, line "Product Serial Number:".
     ✅ CNBRS650GY  (digit 6, digit 5, digit 0, then letters GY at the END)
     ❌ CNBRSG50GY  (wrong — G is not a digit here)
     Rule: if you see what looks like "G" followed by digits, it is almost certainly digit "6".
-  • Digit "8" vs Letter "B" — HP serials use DIGIT "8", NEVER letter "B" mid-serial.
-    ✅ CNBRS651F8   ❌ CNBRS651FB
-    ✅ CNBRS6509F   ❌ CNBRS650BF
+  • Digit "8" vs Letter "B" — ต้องดูจาก context ของ serial นั้นๆ
+    HP serials สามารถลงท้ายด้วยตัวอักษร B ได้จริง เช่น CNBRS650MB (M และ B เป็นตัวอักษร)
+    แต่กลางชุดตัวเลข (digits block) ถ้าเจอ B คือ digit 8
+    ✅ CNBRS651F8  — F8 ท้าย (8 คือ digit)
+    ✅ CNBRS650MB  — MB ท้าย (M และ B คือตัวอักษรจริง)
+    Rule: อ่านตามที่เห็นบนกระดาษ อย่า assume ว่า B ท้าย serial ต้องเป็น 8 เสมอ
   • Digit "0" vs Letter "O" — read carefully from context.
   • Digit "1" vs Letter "I" — read carefully from context.
   Known serial patterns (10 chars, all uppercase):
@@ -158,6 +161,49 @@ export async function POST(req) {
   const arr = Array.isArray(parsed) ? parsed : images.map(() => null);
   while (arr.length < images.length) arr.push(null);
 
+  /* ─── Programmatic Serial Correction ───────────────────────────────────────
+   * HP serial numbers follow strict patterns — we can fix OCR errors
+   * by knowing which positions must be digits vs letters.
+   *
+   * Known HP LaserJet patterns (10 chars):
+   *   PHCBG + 5 digits    e.g. PHCBG29182
+   *   CNBRS + 6 alphanum  e.g. CNBRS650GY, CNBRS651F8, CNBRS6509F
+   *
+   * Common OCR errors:
+   *   digit 6 ↔ letter G     digit 8 ↔ letter B
+   *   digit 0 ↔ letter O     digit 1 ↔ letter I / L
+   *   digit 5 ↔ letter S     digit 2 ↔ letter Z
+   ─────────────────────────────────────────────────────────────────────────── */
+  const CHAR_TO_DIGIT = { 'O':'0','I':'1','L':'1','B':'8','G':'6','S':'5','Z':'2','T':'7' };
+
+  function toDigit(c) { return CHAR_TO_DIGIT[c] ?? c; }
+
+  function correctSerial(raw) {
+    const s = raw.toUpperCase().replace(/\s/g, "").replace(/[^A-Z0-9]/g, "");
+    if (s.length !== 10) return s;
+
+    const prefix5 = s.slice(0, 5);  // first 5 chars — always letters, keep as-is
+    const rest    = s.slice(5);     // last 5 chars — mixed digits/letters
+
+    /* PHCBG____ : last 5 must ALL be digits */
+    if (/^PHC[A-Z]{2}$/.test(prefix5)) {
+      return prefix5 + rest.split("").map(toDigit).join("");
+    }
+
+    /* CNBRS____ :
+     *   pos 5,6,7 (rest[0..2]) → always digits  e.g. "650", "651"
+     *   pos 8,9   (rest[3..4]) → mixed           e.g. "GY","K6","F8","9F","M8","HQ"
+     *   → force-correct only the digit positions (0,1,2 of rest)
+     */
+    if (/^CNB[A-Z]{2}$/.test(prefix5)) {
+      const digits = rest.slice(0, 3).split("").map(toDigit).join("");  // pos5-7 must be digits
+      const tail   = rest.slice(3);                                      // pos8-9 keep as-is
+      return prefix5 + digits + tail;
+    }
+
+    return s;
+  }
+
   const results = arr.slice(0, images.length).map((r) => {
     if (!r || !r.serial) return null;
 
@@ -165,8 +211,8 @@ export async function POST(req) {
     const gt    = Math.floor(parseFloat(rawGT));  // ตัดทศนิยมออก ไม่ปัดขึ้น
 
     return {
-      serial:     String(r.serial).trim().toUpperCase(),
-      model:      String(r.model  ?? "HP LaserJet").trim(),
+      serial:     correctSerial(String(r.serial).trim()),
+      model:      String(r.model ?? "HP LaserJet").trim(),
       printA5:    Math.round(Number(r.printA5 ?? 0)),
       grandTotal: gt,
     };
