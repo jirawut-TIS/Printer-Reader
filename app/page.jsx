@@ -3,13 +3,16 @@ import { useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 
 /* ══════════════════════════════════════════════════════
-   CONFIG  — ปรับตามความต้องการ
-   WORKERS  : จำนวน API calls พร้อมกัน (3 = ปลอดภัย, 5 = เร็วขึ้น)
-   SCALE    : ความละเอียดภาพ (1.5 = เร็ว, 2.0 = ชัดกว่า)
+   CONFIG
+   WORKERS : workers พร้อมกัน  (เพิ่ม = เร็วขึ้น แต่ rate limit มากขึ้น)
+   BATCH   : หน้าต่อ 1 API call (2 = เร็ว 2x, Claude ยังแม่นยำ)
+   SCALE   : ความละเอียด (1.3 = เร็ว+เล็ก, 1.6 = ชัดกว่า)
+   QUALITY : JPEG quality (0.65 = เร็ว, 0.80 = คมชัดกว่า)
 ══════════════════════════════════════════════════════ */
-const WORKERS = 4;
-const SCALE   = 1.6;
-const QUALITY = 0.75;
+const WORKERS = 8;
+const BATCH   = 2;
+const SCALE   = 1.3;
+const QUALITY = 0.65;
 
 /* ─── Styles ──────────────────────────────────────── */
 const S = {
@@ -84,58 +87,47 @@ export default function Home() {
     setFile(f); setRows([]); setStatus("idle"); setErrMsg(""); setLiveCount(0);
   };
 
-  /* ── render 1 page → base64 JPEG ── */
+  /* ── render 1 page → base64 JPEG (with render cache) ── */
+  const renderCache = useRef({});
   const toBase64 = useCallback(async (pdfDoc, pageNum) => {
+    if (renderCache.current[pageNum]) return renderCache.current[pageNum];
     const page   = await pdfDoc.getPage(pageNum);
     const vp     = page.getViewport({ scale: SCALE });
     const canvas = document.createElement("canvas");
     canvas.width  = vp.width;
     canvas.height = vp.height;
     await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
-    return canvas.toDataURL("image/jpeg", QUALITY).split(",")[1];
+    const b64 = canvas.toDataURL("image/jpeg", QUALITY).split(",")[1];
+    renderCache.current[pageNum] = b64;
+    return b64;
   }, []);
 
-  /* ── call API 1 page, exponential backoff on 429 ── */
-  const callOne = useCallback(async (image, pageNum) => {
+  /* ── call API with 1-2 pages, exponential backoff on 429 ── */
+  const callBatch = useCallback(async (images, pageNums) => {
     const MAX = 6;
     for (let attempt = 0; attempt < MAX; attempt++) {
-      if (abortRef.current) return null;
+      if (abortRef.current) return pageNums.map(() => null);
 
-      /* รอ global rate-limit cooldown */
       const now = Date.now();
-      if (now < rlUntilRef.current) {
+      if (now < rlUntilRef.current)
         await new Promise(r => setTimeout(r, rlUntilRef.current - now + 200));
-      }
 
-      /* exponential backoff ก่อน retry */
-      if (attempt > 0) {
-        await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt-1), 30000)));
-      }
+      if (attempt > 0)
+        await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt-1), 20000)));
 
       try {
         const res = await fetch("/api/extract", {
           method:  "POST",
           headers: { "Content-Type":"application/json" },
-          body:    JSON.stringify({ images:[image], pageNums:[pageNum] }),
+          body:    JSON.stringify({ images, pageNums }),
         });
-
-        if (res.status === 429) {
-          /* rate limit — set global cooldown 20s ให้ทุก worker รอ */
-          rlUntilRef.current = Date.now() + 20000;
-          continue;
-        }
+        if (res.status === 429) { rlUntilRef.current = Date.now() + 15000; continue; }
         if (!res.ok) continue;
-
         const data = await res.json();
-        const item = data.results?.[0];
-        if (item) return item;
-
-        /* Claude คืน null = ไม่ใช่ Usage Page → ไม่ต้อง retry */
-        return null;
-
-      } catch (_) { /* network error → retry */ }
+        return data.results ?? pageNums.map(() => null);
+      } catch (_) {}
     }
-    return null;
+    return pageNums.map(() => null);
   }, []);
 
   /* ══════════════════════════════════════════════════
@@ -147,6 +139,7 @@ export default function Home() {
     if (!file) return;
     setStatus("loading"); setPct(0); setRows([]); setErrMsg("");
     setLiveCount(0); abortRef.current = false; rlUntilRef.current = 0;
+    renderCache.current = {};
 
     try {
       /* โหลด PDF.js จาก CDN */
@@ -165,36 +158,46 @@ export default function Home() {
       const total  = pdfDoc.numPages;
       setMsg(`พบ ${total} หน้า — เริ่มประมวลผลด้วย ${WORKERS} workers...`);
 
-      /* ── Shared state (ใช้ closure refs ไม่ใช่ React state เพื่อความเร็ว) ── */
-      const queue      = Array.from({ length: total }, (_, i) => i + 1); // [1..N]
-      const collected  = [];    // ผลที่ได้
-      let   processed  = 0;     // หน้าที่ประมวลผลแล้ว
+      /* ── Shared state ── */
+      const queue     = Array.from({ length: total }, (_, i) => i + 1);
+      const collected = [];
+      let   processed = 0;
 
-      /* ── Worker function ── */
+      /* ── Worker: ดึง BATCH หน้าจาก queue ต่อครั้ง + pre-render ── */
       const worker = async (workerId) => {
         while (queue.length > 0 && !abortRef.current) {
-          const pageNum = queue.shift();
-          if (pageNum === undefined) break;
+          /* ดึง BATCH หน้าจาก queue */
+          const batch = [];
+          while (batch.length < BATCH && queue.length > 0) batch.push(queue.shift());
+          if (!batch.length) break;
 
           try {
-            /* render + API */
-            const img  = await toBase64(pdfDoc, pageNum);
-            const item = await callOne(img, pageNum);
-            if (item) {
-              collected.push(item);
-              setLiveCount(collected.length);
+            /* render ทั้ง batch พร้อมกัน */
+            const images = await Promise.all(batch.map(p => toBase64(pdfDoc, p)));
 
-              /* live table update ทุก 3 เครื่อง */
-              if (collected.length % 3 === 0 || collected.length <= 5) {
-                const map = buildMap(collected);
-                setRows([...map.values()]);
+            /* pre-render batch ถัดไปขณะรอ API (pipeline) */
+            const nextBatch = queue.slice(0, BATCH);
+            if (nextBatch.length) Promise.all(nextBatch.map(p => toBase64(pdfDoc, p)));
+
+            /* ส่ง API */
+            const results = await callBatch(images, batch);
+
+            results.forEach((item, idx) => {
+              if (item) {
+                // เก็บ pageNum ที่เจอ serial นี้ครั้งแรก เพื่อ sort ตามลำดับ PDF
+                item._page = batch[idx];
+                collected.push(item);
+                setLiveCount(collected.length);
+                if (collected.length % 2 === 0 || collected.length <= 3) {
+                  setRows([...buildMap(collected).values()]);
+                }
               }
-            }
-          } catch (_) { /* individual page error — skip */ }
+            });
+          } catch (_) {}
 
-          processed++;
+          processed += batch.length;
           setPct(Math.round((processed / total) * 100));
-          setMsg(`⚡ Worker${workerId}: หน้า ${pageNum}/${total} — พบ ${collected.length} เครื่องพิมพ์`);
+          setMsg(`⚡ Worker${workerId}: หน้า ${batch[batch.length-1]}/${total} — พบ ${collected.length} เครื่องพิมพ์`);
         }
       };
 
@@ -226,10 +229,12 @@ export default function Home() {
   /* ── หยุดการทำงาน ── */
   const handleStop = () => { abortRef.current = true; };
 
-  /* ── Aggregate collected → Map by serial ── */
+  /* ── Aggregate collected → Map by serial, sorted by PDF page order ── */
   function buildMap(collected) {
     const map = new Map();
-    collected.forEach((r) => {
+    // sort by page number ก่อน เพื่อให้ serial ที่เจอแรกสุด = หน้าแรกของ PDF
+    const sorted = [...collected].sort((a, b) => (a._page||0) - (b._page||0));
+    sorted.forEach((r) => {
       if (map.has(r.serial)) {
         const e = map.get(r.serial);
         e.printA4    += r.printA4    || 0;
@@ -281,7 +286,7 @@ export default function Home() {
           <div style={S.hTitle}>Printer Usage Reader</div>
           <div style={S.hSub}>HP Printer Usage Report · Worker Pool · Claude Vision</div>
         </div>
-        <div style={S.hBadge}>⚡ {WORKERS} Workers Parallel</div>
+        <div style={S.hBadge}>⚡ {WORKERS} Workers × {BATCH} pages/call</div>
       </div>
 
       <div style={S.wrap}>
@@ -346,7 +351,7 @@ export default function Home() {
         {status === "loading" && (
           <div style={S.progWrap}>
             <div style={S.progLabel}>
-              <span>⚡ {WORKERS} Workers · พบ {liveCount} เครื่องพิมพ์</span>
+              <span>⚡ {WORKERS} Workers × {BATCH} หน้า/call — พบ {liveCount} เครื่องพิมพ์</span>
               <span>{pct}%</span>
             </div>
             <div style={S.progBg}><div style={S.progFill(pct)} /></div>
