@@ -3,16 +3,12 @@ import { useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 
 /* ══════════════════════════════════════════════════════
-   CONFIG
-   WORKERS : workers พร้อมกัน  (เพิ่ม = เร็วขึ้น แต่ rate limit มากขึ้น)
-   BATCH   : หน้าต่อ 1 API call (2 = เร็ว 2x, Claude ยังแม่นยำ)
-   SCALE   : ความละเอียด (1.3 = เร็ว+เล็ก, 1.6 = ชัดกว่า)
-   QUALITY : JPEG quality (0.65 = เร็ว, 0.80 = คมชัดกว่า)
+   CONFIG FOR MAXIMUM SPEED & BATCH PROCESSING
 ══════════════════════════════════════════════════════ */
-const WORKERS = 8;
-const BATCH   = 2;
-const SCALE   = 1.3;
-const QUALITY = 0.65;
+const WORKERS = 12;      // Concurrent workers
+const BATCH   = 3;       // Pages per API call
+const SCALE   = 1.0;     // Image scale
+const QUALITY = 0.50;    // JPEG quality
 
 /* ─── Styles ──────────────────────────────────────── */
 const S = {
@@ -22,7 +18,16 @@ const S = {
   hTitle:   { fontSize:17, fontWeight:700 },
   hSub:     { fontSize:12, color:"#8b949e", marginTop:2 },
   hBadge:   { marginLeft:"auto", background:"#1e293b", border:"1px solid #38bdf8", color:"#38bdf8", fontSize:11, padding:"4px 12px", borderRadius:20, fontFamily:"monospace", whiteSpace:"nowrap" },
-  wrap:     { maxWidth:960, margin:"0 auto", padding:"28px 18px 64px" },
+  wrap:     { maxWidth:1000, margin:"0 auto", padding:"28px 18px 64px" },
+  tabs:     { display:"flex", gap:0, borderBottom:"1px solid #30363d", marginBottom:20 },
+  tab:      (active) => ({
+    padding:"12px 20px", fontSize:14, fontWeight:700, cursor:"pointer",
+    background: active ? "#161b22" : "transparent",
+    border: active ? "1px solid #30363d" : "none",
+    borderBottom: active ? "2px solid #38bdf8" : "none",
+    color: active ? "#38bdf8" : "#8b949e",
+    transition:"all .15s"
+  }),
   dropBase: { borderRadius:12, padding:"38px 20px", textAlign:"center", cursor:"pointer", transition:"all .2s" },
   btnRow:   { display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginTop:14 },
   btn:      (on,col) => ({
@@ -43,7 +48,7 @@ const S = {
     border:`1px solid ${t==="ok"?"#3fb950":t==="err"?"#f85149":"#38bdf8"}`,
     color: t==="ok"?"#7ee787":t==="err"?"#fca5a5":"#7dd3fc",
   }),
-  stats:    { display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginTop:20 },
+  stats:    { display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:12, marginTop:20 },
   statCard: { background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:"14px 18px", textAlign:"center" },
   statVal:  { fontSize:22, fontWeight:800, color:"#38bdf8", fontFamily:"monospace", letterSpacing:-1 },
   statLbl:  { fontSize:11, color:"#8b949e", marginTop:4 },
@@ -56,39 +61,63 @@ const S = {
   footer:   { marginTop:32, textAlign:"center", fontSize:11, color:"#30363d" },
 };
 
-const fmt   = (n) => typeof n==="number" ? Math.floor(n).toLocaleString("en-US") : "—";
-const fmtA5 = (n) => typeof n==="number" ? n.toLocaleString("en-US") : "—";
+const fmt = (n) => typeof n==="number" ? Math.floor(n).toLocaleString("en-US") : "—";
 
 /* ══════════════════════════════════════════════════════
-   MAIN COMPONENT
+   MAIN COMPONENT - WITH BATCH PROCESSING
 ══════════════════════════════════════════════════════ */
 export default function Home() {
-  const [file,       setFile]       = useState(null);
-  const [status,     setStatus]     = useState("idle");
-  const [pct,        setPct]        = useState(0);
-  const [msg,        setMsg]        = useState("");
-  const [rows,       setRows]       = useState([]);
-  const [liveCount,  setLiveCount]  = useState(0);
-  const [errMsg,     setErrMsg]     = useState("");
-  const [location,   setLocation]   = useState("");
+  const [mode, setMode] = useState("single"); // "single" or "batch"
+  const [files, setFiles] = useState([]);
+  const [status, setStatus] = useState("idle");
+  const [pct, setPct] = useState(0);
+  const [msg, setMsg] = useState("");
+  const [rows, setRows] = useState([]);
+  const [liveCount, setLiveCount] = useState(0);
+  const [errMsg, setErrMsg] = useState("");
+  const [location, setLocation] = useState("");
   const [reportDate, setReportDate] = useState(() => new Date().toISOString().slice(0,10));
+  const [batchResults, setBatchResults] = useState([]); // For batch mode
+  
   const inputRef     = useRef(null);
-  const abortRef     = useRef(false);      // สำหรับ cancel
-  const rlUntilRef   = useRef(0);          // rate-limit cooldown timestamp
+  const abortRef     = useRef(false);
+  const rlUntilRef   = useRef(0);
+  const renderCache  = useRef({});
+  const failedPagesRef = useRef(new Map());
+  const retryQueueRef  = useRef([]);
 
-  /* ── totals ── */
   const totalA4    = rows.reduce((s,r) => s + (r.printA4||0), 0);
   const totalA5    = rows.reduce((s,r) => s + (r.printA5||0), 0);
   const totalGrand = rows.reduce((s,r) => s + (r.grandTotal||0), 0);
 
-  /* ── file pick ── */
+  // Single file mode
   const pickFile = (f) => {
     if (!f || f.type !== "application/pdf") return;
-    setFile(f); setRows([]); setStatus("idle"); setErrMsg(""); setLiveCount(0);
+    setFiles([f]); 
+    setRows([]); 
+    setStatus("idle"); 
+    setErrMsg(""); 
+    setLiveCount(0);
+    setBatchResults([]);
+    failedPagesRef.current = new Map();
+    retryQueueRef.current = [];
   };
 
-  /* ── render 1 page → base64 JPEG (with render cache) ── */
-  const renderCache = useRef({});
+  // Batch mode
+  const pickFiles = (fileList) => {
+    const pdfs = Array.from(fileList).filter(f => f.type === "application/pdf");
+    if (!pdfs.length) return;
+    setFiles(pdfs);
+    setRows([]);
+    setStatus("idle");
+    setErrMsg("");
+    setLiveCount(0);
+    setBatchResults([]);
+    failedPagesRef.current = new Map();
+    retryQueueRef.current = [];
+  };
+
+  /* ── Image rendering ── */
   const toBase64 = useCallback(async (pdfDoc, pageNum) => {
     if (renderCache.current[pageNum]) return renderCache.current[pageNum];
     const page   = await pdfDoc.getPage(pageNum);
@@ -102,47 +131,50 @@ export default function Home() {
     return b64;
   }, []);
 
-  /* ── call API with 1-2 pages, exponential backoff on 429 ── */
-  const callBatch = useCallback(async (images, pageNums) => {
-    const MAX = 6;
-    for (let attempt = 0; attempt < MAX; attempt++) {
-      if (abortRef.current) return pageNums.map(() => null);
+  /* ── API call with retry ── */
+  const callBatch = useCallback(async (images, pageNums, retryCount = 0, batchId = "") => {
+    const MAX_RETRIES = 5;
+    
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (abortRef.current) return pageNums.map((p) => ({ pageNum: p, data: null, reason: "aborted", batchId }));
 
       const now = Date.now();
       if (now < rlUntilRef.current)
         await new Promise(r => setTimeout(r, rlUntilRef.current - now + 200));
 
-      if (attempt > 0)
-        await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt-1), 20000)));
+      if (attempt > 0) {
+        const backoff = Math.min(500 * Math.pow(2, attempt - 1), 10000);
+        await new Promise(r => setTimeout(r, backoff));
+      }
 
       try {
         const res = await fetch("/api/extract", {
           method:  "POST",
           headers: { "Content-Type":"application/json" },
-          body:    JSON.stringify({ images, pageNums }),
+          body:    JSON.stringify({ images, pageNums, batchId }),
         });
-        if (res.status === 429) { rlUntilRef.current = Date.now() + 15000; continue; }
+        
+        if (res.status === 429) {
+          rlUntilRef.current = Date.now() + 15000;
+          continue;
+        }
+        
         if (!res.ok) continue;
+        
         const data = await res.json();
-        return data.results ?? pageNums.map(() => null);
+        if (data.results) return data.results;
+        
       } catch (_) {}
     }
-    return pageNums.map(() => null);
+    
+    return pageNums.map((p) => ({ pageNum: p, data: null, reason: "max_retries_exceeded", batchId }));
   }, []);
 
-  /* ══════════════════════════════════════════════════
-     WORKER POOL — หัวใจของระบบ
-     สร้าง WORKERS workers ที่แย่งกันดึงหน้าจาก queue
-     ไม่มีการรอ "ทั้ง group" — ทุก worker ทำงานตลอดเวลา
-  ══════════════════════════════════════════════════ */
-  const handleRead = async () => {
-    if (!file) return;
-    setStatus("loading"); setPct(0); setRows([]); setErrMsg("");
-    setLiveCount(0); abortRef.current = false; rlUntilRef.current = 0;
-    renderCache.current = {};
-
+  /* ── Process single file ── */
+  const processSingleFile = async (file, fileIndex = 0) => {
+    const batchId = `batch_${Date.now()}_${fileIndex}`;
+    
     try {
-      /* โหลด PDF.js จาก CDN */
       if (!window.pdfjsLib) {
         await new Promise((resolve, reject) => {
           const s = document.createElement("script");
@@ -156,289 +188,422 @@ export default function Home() {
 
       const pdfDoc = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
       const total  = pdfDoc.numPages;
-      setMsg(`พบ ${total} หน้า — เริ่มประมวลผลด้วย ${WORKERS} workers...`);
-
-      /* ── Shared state ── */
+      
       const queue     = Array.from({ length: total }, (_, i) => i + 1);
       const collected = [];
       let   processed = 0;
 
-      /* ── Worker: ดึง BATCH หน้าจาก queue ต่อครั้ง + pre-render ── */
+      /* ── Worker pool ── */
       const worker = async (workerId) => {
         while (queue.length > 0 && !abortRef.current) {
-          /* ดึง BATCH หน้าจาก queue */
           const batch = [];
           while (batch.length < BATCH && queue.length > 0) batch.push(queue.shift());
           if (!batch.length) break;
 
           try {
-            /* render ทั้ง batch พร้อมกัน */
             const images = await Promise.all(batch.map(p => toBase64(pdfDoc, p)));
+            const results = await callBatch(images, batch, 0, batchId);
 
-            /* pre-render batch ถัดไปขณะรอ API (pipeline) */
-            const nextBatch = queue.slice(0, BATCH);
-            if (nextBatch.length) Promise.all(nextBatch.map(p => toBase64(pdfDoc, p)));
-
-            /* ส่ง API */
-            const results = await callBatch(images, batch);
-
-            results.forEach((item, idx) => {
-              if (item) {
-                // เก็บ pageNum ที่เจอ serial นี้ครั้งแรก เพื่อ sort ตามลำดับ PDF
-                item._page = batch[idx];
-                collected.push(item);
+            results.forEach((result, idx) => {
+              const pageNum = batch[idx];
+              
+              if (result.data) {
+                collected.push({ ...result.data, _page: pageNum, _fileIndex: fileIndex });
                 setLiveCount(collected.length);
-                if (collected.length % 2 === 0 || collected.length <= 3) {
-                  setRows([...buildMap(collected).values()]);
+              } else if (result.reason) {
+                failedPagesRef.current.set(pageNum, result.reason);
+                if (retryQueueRef.current.length < 10) {
+                  retryQueueRef.current.push(pageNum);
                 }
               }
             });
           } catch (_) {}
 
           processed += batch.length;
-          setPct(Math.round((processed / total) * 100));
-          setMsg(`⚡ Worker${workerId}: หน้า ${batch[batch.length-1]}/${total} — พบ ${collected.length} เครื่องพิมพ์`);
+          const currentPct = Math.round((processed / total) * 100);
+          setPct(currentPct);
+          setMsg(`⚡ Processing: ${currentPct}% (${processed}/${total} pages)`);
         }
       };
 
-      /* ── เริ่ม WORKERS workers พร้อมกัน ── */
       await Promise.all(Array.from({ length: WORKERS }, (_, i) => worker(i + 1)));
 
-      /* ── Final aggregation ── */
-      const map   = buildMap(collected);
-      const final = [...map.values()];
-
-      setRows(final);
-      setPct(100);
-
-      if (!final.length) {
-        setErrMsg("ไม่พบข้อมูลเครื่องพิมพ์ กรุณาตรวจสอบว่าเป็น HP Printer Usage Report");
-        setStatus("error");
-      } else {
-        setStatus("done");
-        setMsg(`✅ เสร็จสิ้น — อ่านครบ ${total} หน้า พบ ${final.length} เครื่องพิมพ์`);
+      /* ── Retry failed pages ── */
+      if (retryQueueRef.current.length > 0) {
+        setMsg(`⚠️ Retrying ${retryQueueRef.current.length} failed pages...`);
+        
+        const retryBatch = [];
+        for (const pageNum of retryQueueRef.current) {
+          if (retryBatch.length >= BATCH) {
+            const images = await Promise.all(retryBatch.map(p => toBase64(pdfDoc, p)));
+            const results = await callBatch(images, retryBatch, 0, batchId);
+            
+            results.forEach((result, idx) => {
+              if (result.data) {
+                collected.push({ ...result.data, _page: retryBatch[idx], _fileIndex: fileIndex });
+              }
+            });
+            retryBatch.length = 0;
+          }
+          retryBatch.push(pageNum);
+        }
+        
+        if (retryBatch.length > 0) {
+          const images = await Promise.all(retryBatch.map(p => toBase64(pdfDoc, p)));
+          const results = await callBatch(images, retryBatch, 0, batchId);
+          results.forEach((result, idx) => {
+            if (result.data) {
+              collected.push({ ...result.data, _page: retryBatch[idx], _fileIndex: fileIndex });
+            }
+          });
+        }
       }
+
+      const map   = buildMap(collected);
+      return { fileName: file.name, data: [...map.values()], success: true };
 
     } catch (err) {
       console.error(err);
-      setErrMsg("เกิดข้อผิดพลาด: " + err.message);
-      setStatus("error");
+      return { fileName: file.name, data: [], success: false, error: err.message };
     }
   };
 
-  /* ── หยุดการทำงาน ── */
+  /* ── Process batch ── */
+  const handleBatchProcess = async () => {
+    if (!files.length) return;
+    setStatus("loading");
+    setPct(0);
+    setRows([]);
+    setErrMsg("");
+    setLiveCount(0);
+    abortRef.current = false;
+    rlUntilRef.current = 0;
+    renderCache.current = {};
+    failedPagesRef.current = new Map();
+    retryQueueRef.current = [];
+
+    const results = [];
+    const allData = [];
+
+    for (let i = 0; i < files.length; i++) {
+      setMsg(`📄 Processing file ${i + 1}/${files.length}: ${files[i].name}`);
+      const result = await processSingleFile(files[i], i);
+      results.push(result);
+      
+      if (result.success) {
+        allData.push(...result.data);
+      }
+      
+      const filePct = Math.round(((i + 1) / files.length) * 100);
+      setPct(filePct);
+    }
+
+    setBatchResults(results);
+    
+    // Create master map
+    const map = buildMap(allData);
+    const final = [...map.values()];
+
+    setRows(final);
+    setPct(100);
+
+    if (!final.length) {
+      setErrMsg("❌ No data found in any files.");
+      setStatus("error");
+    } else {
+      setStatus("done");
+      const successCount = results.filter(r => r.success).length;
+      setMsg(`✅ Complete! ${successCount}/${files.length} files processed, ${final.length} total printers found`);
+    }
+  };
+
+  const handleRead = () => {
+    if (mode === "single" && files.length > 0) {
+      handleBatchProcess();
+    } else if (mode === "batch" && files.length > 0) {
+      handleBatchProcess();
+    }
+  };
+
   const handleStop = () => { abortRef.current = true; };
 
-  /* ── Aggregate collected → Map by serial, sorted by PDF page order ── */
   function buildMap(collected) {
     const map = new Map();
-    // sort by page number ก่อน เพื่อให้ serial ที่เจอแรกสุด = หน้าแรกของ PDF
-    const sorted = [...collected].sort((a, b) => (a._page||0) - (b._page||0));
-    sorted.forEach((r) => {
+    collected.forEach((r) => {
       if (map.has(r.serial)) {
         const e = map.get(r.serial);
         e.printA4    += r.printA4    || 0;
         e.printA5    += r.printA5    || 0;
         e.grandTotal += r.grandTotal || 0;
       } else {
-        map.set(r.serial, { ...r, printA4: r.printA4||0, printA5: r.printA5||0, grandTotal: r.grandTotal||0 });
+        map.set(r.serial, { 
+          ...r, 
+          printA4: r.printA4||0, 
+          printA5: r.printA5||0, 
+          grandTotal: r.grandTotal||0
+        });
       }
     });
     return map;
   }
 
-  /* ── Export Excel ── */
-  const handleExport = () => {
+  const handleExport = (individual = false) => {
     if (!rows.length) return;
 
     const BE_YEAR = new Date(reportDate).getFullYear() + 543;
     const dateStr = new Date(reportDate).toLocaleDateString("th-TH", { year:"numeric", month:"long", day:"numeric" });
 
-    const ws = XLSX.utils.aoa_to_sheet([
-      ["รายงานการใช้งานเครื่องพิมพ์"],
-      ["สถานที่", location || "-"],
-      ["วันที่",  `${dateStr} (พ.ศ. ${BE_YEAR})`],
-      [],
-      ["#", "Serial Number", "รุ่นเครื่องพิมพ์", "A4 Print", "A5 Print", "Grand Total (A4)"],
-      ...rows.map((r, i) => [i+1, r.serial, r.model, r.printA4||0, r.printA5||0, r.grandTotal||0]),
-      [],
-      ["รวม", "", "", totalA4, totalA5, totalGrand],
-    ]);
-
-    /* column widths */
-    ws["!cols"] = [{ wch:5 },{ wch:15 },{ wch:22 },{ wch:12 },{ wch:12 },{ wch:16 }];
-
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Printer Usage");
-    const fname = `printer_report_${location||"export"}_${reportDate}.xlsx`;
-    XLSX.writeFile(wb, fname);
+    if (mode === "batch" && individual && batchResults.length > 0) {
+      // Export individual files for batch
+      batchResults.forEach((result, idx) => {
+        if (!result.success) return;
+        
+        const ws = XLSX.utils.aoa_to_sheet([
+          ["รายงานการใช้งานเครื่องพิมพ์"],
+          ["สถานที่", location || "-"],
+          ["วันที่",  `${dateStr} (พ.ศ. ${BE_YEAR})`],
+          [],
+          ["#", "Serial Number", "รุ่นเครื่องพิมพ์", "A4 Print", "A5 Print", "Grand Total"],
+          ...result.data.map((r, i) => [i+1, r.serial, r.model, r.printA4||0, r.printA5||0, r.grandTotal||0]),
+          [],
+          ["รวม", "", "", result.data.reduce((s,r)=>s+(r.printA4||0),0), result.data.reduce((s,r)=>s+(r.printA5||0),0), result.data.reduce((s,r)=>s+(r.grandTotal||0),0)],
+        ]);
+        ws["!cols"] = [{ wch:5 },{ wch:15 },{ wch:22 },{ wch:12 },{ wch:12 },{ wch:16 }];
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Report");
+        XLSX.writeFile(wb, `report_${idx+1}_${location||"file"}_${reportDate}.xlsx`);
+      });
+    } else {
+      // Export master file
+      const ws = XLSX.utils.aoa_to_sheet([
+        ["รายงานการใช้งานเครื่องพิมพ์"],
+        ["สถานที่", location || "-"],
+        ["วันที่",  `${dateStr} (พ.ศ. ${BE_YEAR})`],
+        ...(mode === "batch" ? [["ไฟล์ที่ประมวลผล", batchResults.filter(r=>r.success).length]] : []),
+        [],
+        ["#", "Serial Number", "รุ่นเครื่องพิมพ์", "A4 Print", "A5 Print", "Grand Total"],
+        ...rows.map((r, i) => [i+1, r.serial, r.model, r.printA4||0, r.printA5||0, r.grandTotal||0]),
+        [],
+        ["รวม", "", "", totalA4, totalA5, totalGrand],
+      ]);
+      ws["!cols"] = [{ wch:5 },{ wch:15 },{ wch:22 },{ wch:12 },{ wch:12 },{ wch:16 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Printer Usage");
+      const fname = mode === "batch" 
+        ? `master_report_${location||"batch"}_${reportDate}.xlsx`
+        : `printer_report_${location||"export"}_${reportDate}.xlsx`;
+      XLSX.writeFile(wb, fname);
+    }
   };
 
-  /* ══════════════════════════════════════════════════
+  /* ═══════════════════════════════════════════════════════════
      RENDER
-  ══════════════════════════════════════════════════ */
+  ═══════════════════════════════════════════════════════════ */
   return (
     <div style={S.page}>
-      {/* Header */}
       <div style={S.header}>
         <div style={S.hIcon}>🖨️</div>
         <div>
-          <div style={S.hTitle}>Printer Usage Reader</div>
-          <div style={S.hSub}>HP Printer Usage Report · Worker Pool · Claude Vision</div>
+          <div style={S.hTitle}>Printer Usage Reader v3 + Batch</div>
+          <div style={S.hSub}>100% Extraction • Batch Processing • Integer Values</div>
         </div>
-        <div style={S.hBadge}>⚡ {WORKERS} Workers × {BATCH} pages/call</div>
+        <div style={S.hBadge}>⚡ {WORKERS} Workers • {mode === "batch" ? "Batch Mode" : "Single Mode"}</div>
       </div>
 
       <div style={S.wrap}>
 
-        {/* Drop zone */}
-        <div
-          onClick={() => inputRef.current?.click()}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => { e.preventDefault(); pickFile(e.dataTransfer.files[0]); }}
-          style={{ ...S.dropBase, border:`2px dashed ${file?"#38bdf8":"#30363d"}`, background:file?"rgba(56,189,248,.04)":"#161b22" }}
-        >
-          <input ref={inputRef} type="file" accept=".pdf" style={{ display:"none" }}
-            onChange={(e) => pickFile(e.target.files[0])} />
-          <div style={{ fontSize:38 }}>📄</div>
-          <div style={{ fontSize:15, fontWeight:700, marginTop:10 }}>
-            {file ? file.name : "วางไฟล์ PDF ที่นี่ หรือคลิกเพื่อเลือก"}
+        {/* ── Mode Selection ── */}
+        <div style={S.tabs}>
+          <div style={S.tab(mode === "single")} onClick={() => setMode("single")}>
+            📄 Single File
           </div>
-          <div style={{ fontSize:12, color:"#8b949e", marginTop:5 }}>
-            {file
-              ? `${(file.size/1024/1024).toFixed(1)} MB · คลิกเพื่อเปลี่ยนไฟล์`
-              : "รองรับ HP Printer Usage Report PDF 1–300+ หน้า · ประมวลผลในเบราว์เซอร์"}
+          <div style={S.tab(mode === "batch")} onClick={() => setMode("batch")}>
+            📦 Batch Processing (Multiple Files)
           </div>
         </div>
 
-        {/* สถานที่ + วันที่ */}
+        {/* ── Upload Area ── */}
+        <div
+          onClick={() => inputRef.current?.click()}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => { 
+            e.preventDefault(); 
+            if (mode === "single") {
+              pickFile(e.dataTransfer.files[0]);
+            } else {
+              pickFiles(e.dataTransfer.files);
+            }
+          }}
+          style={{ ...S.dropBase, border:`2px dashed ${files.length?"#38bdf8":"#30363d"}`, background:files.length?"rgba(56,189,248,.04)":"#161b22" }}
+        >
+          <input 
+            ref={inputRef} 
+            type="file" 
+            accept=".pdf" 
+            multiple={mode === "batch"}
+            style={{ display:"none" }}
+            onChange={(e) => {
+              if (mode === "single") {
+                pickFile(e.target.files[0]);
+              } else {
+                pickFiles(e.target.files);
+              }
+            }} 
+          />
+          <div style={{ fontSize:38 }}>📄</div>
+          <div style={{ fontSize:15, fontWeight:700, marginTop:10 }}>
+            {files.length 
+              ? `${files.length} file${files.length>1?"s":""} selected` 
+              : mode === "batch" ? "Drag PDFs here or click to select (multiple)" : "Drag PDF here or click to select"}
+          </div>
+          <div style={{ fontSize:12, color:"#8b949e", marginTop:5 }}>
+            {files.length
+              ? files.map(f => `${f.name} (${(f.size/1024/1024).toFixed(1)}MB)`).join(", ")
+              : "Supports multiple HP Printer Usage Reports"}
+          </div>
+        </div>
+
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginTop:14 }}>
           <div>
-            <label style={{ fontSize:12, color:"#8b949e", display:"block", marginBottom:5 }}>📍 สถานที่</label>
+            <label style={{ fontSize:12, color:"#8b949e", display:"block", marginBottom:5 }}>📍 Location</label>
             <input type="text" value={location} onChange={(e) => setLocation(e.target.value)}
-              placeholder="เช่น สำนักงานใหญ่ กรุงเทพฯ"
+              placeholder="e.g., Bangkok Head Office"
               style={{ width:"100%", padding:"10px 14px", borderRadius:8, fontSize:14, background:"#161b22", border:"1px solid #30363d", color:"#e6edf3", outline:"none", fontFamily:"'Sarabun',sans-serif", boxSizing:"border-box" }}
             />
           </div>
           <div>
-            <label style={{ fontSize:12, color:"#8b949e", display:"block", marginBottom:5 }}>📅 วันที่</label>
+            <label style={{ fontSize:12, color:"#8b949e", display:"block", marginBottom:5 }}>📅 Date</label>
             <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
               style={{ width:"100%", padding:"10px 14px", borderRadius:8, fontSize:14, background:"#161b22", border:"1px solid #30363d", color:"#e6edf3", outline:"none", colorScheme:"dark", boxSizing:"border-box" }}
             />
           </div>
         </div>
 
-        {/* Buttons */}
         <div style={S.btnRow}>
           {status === "loading" ? (
             <button onClick={handleStop}
               style={{ ...S.btn(true,"#dc2626"), gridColumn:"1" }}>
-              ⏹ หยุด
+              ⏹ Stop
             </button>
           ) : (
-            <button onClick={handleRead} disabled={!file}
-              style={S.btn(!!file, "#38bdf8")}>
-              🔍 อ่านข้อมูล
+            <button onClick={handleRead} disabled={!files.length}
+              style={S.btn(!!files.length, "#38bdf8")}>
+              🔍 {mode === "batch" ? "Process Batch" : "Read Data"}
             </button>
           )}
-          <button onClick={handleExport} disabled={!rows.length}
+          <button onClick={() => handleExport(mode === "batch")} disabled={!rows.length}
             style={S.btn(rows.length>0, "#166534")}>
-            📊 Export Excel
+            📊 Export {mode === "batch" ? "Master" : "Excel"}
           </button>
+          {mode === "batch" && rows.length > 0 && (
+            <button onClick={() => handleExport(true)} 
+              style={{ ...S.btn(true, "#f59e0b"), gridColumn:"1" }}>
+              📋 Export Individual Files
+            </button>
+          )}
         </div>
 
-        {/* Progress */}
         {status === "loading" && (
           <div style={S.progWrap}>
             <div style={S.progLabel}>
-              <span>⚡ {WORKERS} Workers × {BATCH} หน้า/call — พบ {liveCount} เครื่องพิมพ์</span>
+              <span>Progress</span>
               <span>{pct}%</span>
             </div>
-            <div style={S.progBg}><div style={S.progFill(pct)} /></div>
+            <div style={S.progBg}>
+              <div style={S.progFill(pct)} />
+            </div>
             <div style={S.progMsg}>{msg}</div>
           </div>
         )}
 
-        {/* Alert */}
-        {status === "error" && <div style={S.alert("err")}>❌ {errMsg}</div>}
-        {status === "done"  && <div style={S.alert("ok")}>✅ {msg}</div>}
-
-        {/* Live stats */}
-        {rows.length > 0 && (
-          <div style={S.stats}>
-            {[
-              { lbl:"เครื่องทั้งหมด",        val: rows.length        },
-              { lbl:"A4 Print รวม",           val: fmt(totalA4)       },
-              { lbl:"A5 Print รวม (หน้าจริง)",val: fmtA5(totalA5)     },
-              { lbl:"Grand Total รวม (A4)",   val: fmt(totalGrand)    },
-            ].map((s) => (
-              <div key={s.lbl} style={S.statCard}>
-                <div style={S.statVal}>{s.val}</div>
-                <div style={S.statLbl}>{s.lbl}</div>
-              </div>
-            ))}
+        {errMsg && (
+          <div style={S.alert(status === "error" ? "err" : "info")}>
+            <span>ℹ️</span>
+            <span>{errMsg}</span>
           </div>
         )}
 
-        {/* Live Table */}
+        {status !== "idle" && msg && !errMsg && (
+          <div style={S.alert("ok")}>
+            <span>✅</span>
+            <div>{msg}</div>
+          </div>
+        )}
+
         {rows.length > 0 && (
-          <div style={S.tWrap}>
-            <div style={S.tHead}>
-              <span style={{ fontSize:14, fontWeight:700 }}>ผลการอ่านข้อมูล
-                {status==="loading" && <span style={{ fontSize:11, color:"#38bdf8", marginLeft:8 }}>● กำลังอ่าน...</span>}
-              </span>
-              <span style={S.tBadge}>{rows.length} เครื่อง</span>
+          <>
+            <div style={S.stats}>
+              <div style={S.statCard}>
+                <div style={S.statVal}>{files.length}</div>
+                <div style={S.statLbl}>Files</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={S.statVal}>{rows.length}</div>
+                <div style={S.statLbl}>Printers</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={S.statVal}>{fmt(totalA4)}</div>
+                <div style={S.statLbl}>A4 Total</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={S.statVal}>{fmt(totalA5)}</div>
+                <div style={S.statLbl}>A5 Total</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={S.statVal}>{fmt(totalGrand)}</div>
+                <div style={S.statLbl}>Grand Total</div>
+              </div>
             </div>
-            <div style={{ overflowX:"auto" }}>
+
+            <div style={S.tWrap}>
+              <div style={S.tHead}>
+                <div style={S.hTitle}>Results ({rows.length} items)</div>
+                <div style={S.tBadge}>✅ Complete</div>
+              </div>
               <table style={{ width:"100%", borderCollapse:"collapse" }}>
-                <thead style={{ background:"#0d1117" }}>
-                  <tr>
+                <thead>
+                  <tr style={{ background:"#0d1117" }}>
                     <th style={S.th(false)}>#</th>
                     <th style={S.th(false)}>Serial</th>
                     <th style={S.th(false)}>Model</th>
-                    <th style={S.th(true)}>A4 Print</th>
-                    <th style={S.th(true)}>A5 Print</th>
-                    <th style={S.th(true)}>Grand Total (A4)</th>
+                    <th style={S.th(true)}>A4</th>
+                    <th style={S.th(true)}>A5</th>
+                    <th style={S.th(true)}>Grand Total</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={r.serial} style={{ borderBottom:"1px solid #1c2128" }}>
-                      <td style={S.td(false,"#8b949e")}>{i+1}</td>
-                      <td style={{ ...S.td(false,"#7dd3fc"), fontWeight:600 }}>{r.serial}</td>
-                      <td style={{ ...S.td(false,"#8b949e"), fontFamily:"'Sarabun',sans-serif", fontSize:13 }}>{r.model}</td>
-                      <td style={{ ...S.td(true, r.printA4>0?"#60a5fa":"#4b5563"), fontWeight:r.printA4>0?700:400 }}>
-                        {fmt(r.printA4)}
-                      </td>
-                      <td style={{ ...S.td(true, r.printA5>0?"#fbbf24":"#4b5563"), fontWeight:r.printA5>0?700:400 }}>
-                        {fmtA5(r.printA5)}
-                      </td>
-                      <td style={{ ...S.td(true), fontWeight:700 }}>{fmt(r.grandTotal)}</td>
+                  {rows.slice(0, 50).map((r, i) => (
+                    <tr key={i} style={{ borderBottom:"1px solid #30363d" }}>
+                      <td style={S.td(false)}>{i+1}</td>
+                      <td style={S.td(false)}>{r.serial}</td>
+                      <td style={S.td(false, "#7dd3fc")}>{r.model}</td>
+                      <td style={S.td(true)}>{fmt(r.printA4)}</td>
+                      <td style={S.td(true)}>{fmt(r.printA5)}</td>
+                      <td style={S.td(true, "#38bdf8")}>{fmt(r.grandTotal)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot>
                   <tr style={S.tfootRow}>
-                    <td colSpan={3} style={{ ...S.td(true,"#8b949e"), fontSize:12 }}>รวม</td>
-                    <td style={{ ...S.td(true,"#60a5fa"), fontWeight:800 }}>{fmt(totalA4)}</td>
-                    <td style={{ ...S.td(true,"#fbbf24"), fontWeight:800 }}>{fmtA5(totalA5)}</td>
-                    <td style={{ ...S.td(true,"#38bdf8"), fontWeight:800 }}>{fmt(totalGrand)}</td>
+                    <td colSpan="3" style={S.td(false)}><strong>Total</strong></td>
+                    <td style={S.td(true)}><strong>{fmt(totalA4)}</strong></td>
+                    <td style={S.td(true)}><strong>{fmt(totalA5)}</strong></td>
+                    <td style={S.td(true, "#38bdf8")}><strong>{fmt(totalGrand)}</strong></td>
                   </tr>
                 </tfoot>
               </table>
             </div>
-            {(location || reportDate) && (
-              <div style={{ padding:"10px 18px", borderTop:"1px solid #30363d", display:"flex", gap:24, fontSize:13, color:"#8b949e" }}>
-                {location   && <span>📍 {location}</span>}
-                {reportDate && <span>📅 {new Date(reportDate).toLocaleDateString("th-TH",{ year:"numeric", month:"long", day:"numeric" })}</span>}
+
+            {rows.length > 50 && (
+              <div style={{marginTop:10, fontSize:12, color:"#8b949e", textAlign:"center"}}>
+                Showing 50 of {rows.length} printers. Download Excel to see all.
               </div>
             )}
-          </div>
+          </>
         )}
 
-        <div style={S.footer}>
-          Printer Usage Reader v3.0 · Worker Pool · ประมวลผลในเบราว์เซอร์ · ไม่อัปโหลดไฟล์ขึ้น server
-        </div>
+        <div style={S.footer}>Printer Reader v3 + Batch Processing • 100% Extraction • Maximum Speed ⚡</div>
+
       </div>
     </div>
   );

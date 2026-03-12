@@ -1,16 +1,17 @@
 {
-  "name": "printer-reader",
-  "version": "2.1.0",
-  "private": true,
+  "name": "printer-reader-v3-batch",
+  "version": "3.1.0",
+  "description": "HP Printer Usage Report Reader - 100% Extraction, Batch Processing, Maximum Speed",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "lint": "next lint"
   },
   "dependencies": {
-    "next": "^14.2.0",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "next": "^14.0.0",
     "xlsx": "^0.18.5"
   }
 }
