@@ -1,7 +1,5 @@
 /**
  * POST /api/extract  — HP Printer Usage Report extractor
- * Claude returns {page, serial, ...} so frontend can sort by page reliably
- * แม้ batch=2 ก็ sort ถูกต้องเพราะ Claude ส่ง page number กลับมา
  */
 export const runtime     = "edge";
 export const maxDuration = 30;
@@ -50,33 +48,25 @@ OUTPUT — pure JSON array, no markdown:
 
 Non-usage page: {"page":N,"serial":null}`;
 
-/* ── OCR serial correction ───────────────────────────────────────── */
 const DIGIT_FIX = { O:"0", I:"1", L:"1", B:"8", G:"6", S:"5", Z:"2", D:"0" };
 
 function correctSerial(raw) {
   const s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g,"");
   if (s.length !== 10) return s;
 
-  // PHCBG series (M406): prefix=PHCBG, chars 6-10 all digits
   if (s.slice(0,4) === "PHCB") {
-    // char[4] should be G — OCR often returns '6','5','C' instead
     const c5 = s[4];
     const suf = (c5==="G"||c5==="6"||c5==="5"||c5==="C") ? s.slice(5) : s.slice(4);
     return "PHCBG" + suf.slice(0,5).split("").map(c=>DIGIT_FIX[c]??c).join("");
   }
 
-  // CNBRS series (M430): prefix=CNBRS, char6 may be 'C' (CNBRSC subtype)
   if (s.slice(0,4) === "CNBR") {
-    // char[4] should be S — OCR returns '5','C','8' sometimes
     const c5 = s[4];
     const inner = (c5==="S"||c5==="5"||c5==="C"||c5==="8") ? s.slice(5) : s.slice(4);
-
     if (inner[0] === "C") {
-      // CNBRSC type: C + 3 digits + 2 as-printed
       const digits = inner.slice(1,4).split("").map(c=>DIGIT_FIX[c]??c).join("");
       return "CNBRSC" + digits + inner.slice(4);
     } else {
-      // CNBRS type: 3 digits + 2 as-printed
       const digits = inner.slice(0,3).split("").map(c=>DIGIT_FIX[c]??c).join("");
       return "CNBRS" + digits + inner.slice(3);
     }
@@ -85,7 +75,6 @@ function correctSerial(raw) {
   return s;
 }
 
-/* ── Handler ─────────────────────────────────────────────────────── */
 export async function POST(req) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return Response.json({ error:"ANTHROPIC_API_KEY not set" }, { status:500 });
@@ -98,7 +87,6 @@ export async function POST(req) {
   if (!Array.isArray(images)||!images.length)
     return Response.json({ error:"images[] required" }, { status:400 });
 
-  // Build multi-image content with labeled page numbers
   const content = [];
   images.forEach((b64,i) => {
     content.push({ type:"text", text:`Page ${pageNums?.[i]??i+1}:` });
