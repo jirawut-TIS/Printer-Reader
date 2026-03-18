@@ -1,7 +1,6 @@
 "use client";
 import { useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
-import MergePanel from "../components/MergePanel";
 
 const WORKERS = 6;
 const BATCH   = 2;
@@ -78,7 +77,6 @@ export default function PrinterApp() {
   const [errMsg,      setErrMsg]      = useState("");
   const [location,    setLocation]    = useState("");
   const [reportDate,  setReportDate]  = useState(()=>new Date().toISOString().slice(0,10));
-  const [tab,         setTab]         = useState("single"); // "single" | "merge"
   const pdfInputRef = useRef(null);
   const xlsInputRef = useRef(null);
   const abortRef    = useRef(false);
@@ -286,31 +284,10 @@ export default function PrinterApp() {
 
   const inp = { width:"100%",padding:"10px 14px",borderRadius:8,fontSize:14,background:"#161b22",border:"1px solid #30363d",color:"#e6edf3",outline:"none",fontFamily:"'Sarabun',sans-serif",boxSizing:"border-box" };
 
-  const tabBtn = (id, label) => (
-    <button onClick={() => setTab(id)} style={{
-      padding: "7px 18px", fontSize: 13, borderRadius: 8, cursor: "pointer",
-      fontFamily: "'Sarabun',sans-serif", fontWeight: 600,
-      border: tab === id ? "1px solid #38bdf8" : "1px solid #30363d",
-      background: tab === id ? "rgba(56,189,248,.15)" : "#161b22",
-      color: tab === id ? "#38bdf8" : "#8b949e",
-      transition: "all .15s",
-    }}>{label}</button>
-  );
-
   return (
     <div style={S.wrap}>
 
-      {/* ── Tab bar ── */}
-      <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
-        {tabBtn("single", "🔍 อ่าน PDF")}
-        {tabBtn("merge",  "🔄 Merge Excel + PDF")}
-      </div>
-
-      {tab === "merge" && <MergePanel />}
-
-      {tab === "single" && <>
-
-      {/* ── Upload zone: Excel เดิม + PDF ใหม่ ── */}
+      {/* ── Upload zone ── */}
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:4 }}>
 
         {/* Excel เดิม */}
@@ -479,7 +456,6 @@ export default function PrinterApp() {
         TIS Printer Reader v3.2 · Excel + PDF Merge · English + Thai
       </div>
 
-      </>}
     </div>
   );
 }

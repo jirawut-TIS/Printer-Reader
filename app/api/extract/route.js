@@ -1,7 +1,6 @@
 /**
  * POST /api/extract  — HP Printer Usage Report extractor
  */
-export const runtime     = "edge";
 export const maxDuration = 30;
 
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";

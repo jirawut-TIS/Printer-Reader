@@ -1,99 +1,78 @@
 "use client";
+/**
+ * MergePanel — อ่าน PDF แล้ว Merge เข้า Excel ที่เปิดอยู่
+ * - รับเฉพาะ PDF (ลบ Excel upload ออก)
+ * - อ่านทุกหน้า แบบ BATCH=1 + retry ครบ 8 รอบ = แม่นยำสูงสุด
+ */
 import { useState, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
 
-const WORKERS = 4;
-const BATCH   = 2;
-const SCALE   = 1.5;
-const QUALITY = 0.72;
+const WORKERS   = 4;   // parallel workers
+const BATCH     = 1;   // 1 หน้า/call → แม่นสุด
+const MAX_RETRY = 8;   // retry สูงสุดต่อ batch
+const SCALE     = 1.8;
+const QUALITY   = 0.80;
 
-// ── Parse Excel → extract Summary-All rows ────────────────────
-function parseExcel(arrayBuffer) {
-  const wb = XLSX.read(arrayBuffer, { type: "array" });
-  const sheetName = wb.SheetNames.find(n => n.toLowerCase().includes("all")) || wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+// ── Build output Excel from PDF results ──────────────────────────
+function buildExcel(rows, filename) {
+  const wb = XLSX.utils.book_new();
 
-  // Find header row (row with "Serial" or "Serial No")
-  let headerIdx = 0;
-  for (let i = 0; i < Math.min(10, raw.length); i++) {
-    if (raw[i].some(c => c && String(c).toLowerCase().includes("serial"))) {
-      headerIdx = i; break;
-    }
-  }
+  // Sheet 1: Detail
+  const detail = [
+    ["#", "Serial Number", "รุ่นเครื่องพิมพ์", "A4 Print", "A5 Print", "Grand Total (A4)"],
+    ...rows.map((r, i) => [
+      i + 1,
+      r.serial || "",
+      r.model  || "",
+      r.printA4    ?? 0,
+      r.printA5    ?? 0,
+      r.grandTotal ?? 0,
+    ]),
+    [],
+    ["รวม", "", "",
+      rows.reduce((s, r) => s + (r.printA4    ?? 0), 0),
+      rows.reduce((s, r) => s + (r.printA5    ?? 0), 0),
+      rows.reduce((s, r) => s + (r.grandTotal ?? 0), 0),
+    ],
+  ];
+  const ws1 = XLSX.utils.aoa_to_sheet(detail);
+  ws1["!cols"] = [{ wch: 4 }, { wch: 14 }, { wch: 24 }, { wch: 12 }, { wch: 12 }, { wch: 16 }];
+  XLSX.utils.book_append_sheet(wb, ws1, "Printer Data");
 
-  const rows = [];
-  for (let i = headerIdx + 1; i < raw.length; i++) {
-    const r = raw[i];
-    const serial = r[2] ? String(r[2]).trim() : null;
-    if (!serial || serial.length < 5) continue;
-    rows.push({
-      rowIdx:   i,          // 0-based index in raw
-      seq:      r[0],
-      model:    r[1],
-      serial:   serial,
-      location: r[3],
-      floor:    r[4],
-      ip:       r[5],
-      totalOld: Number(r[6]  || 0),
-      a5Old:    Number(r[7]  || 0),
-      bwOld:    Number(r[8]  || 0),
-      totalNew: Number(r[9]  || 0),  // will be replaced
-      a5New:    Number(r[10] || 0),  // will be replaced
-      note:     r[13] || null,
-    });
-  }
-  return { wb, sheetName, raw, headerIdx, rows };
-}
+  // Sheet 2: Summary
+  const totalA4    = rows.reduce((s, r) => s + (r.printA4    ?? 0), 0);
+  const totalA5    = rows.reduce((s, r) => s + (r.printA5    ?? 0), 0);
+  const totalGrand = rows.reduce((s, r) => s + (r.grandTotal ?? 0), 0);
+  const summary = XLSX.utils.aoa_to_sheet([
+    ["สรุป"],
+    ["เครื่องทั้งหมด",   rows.length],
+    ["A4 Print รวม",     totalA4],
+    ["A5 Print รวม",     totalA5],
+    ["Grand Total รวม",  totalGrand],
+    ["วันที่", new Date().toLocaleString("th-TH")],
+  ]);
+  XLSX.utils.book_append_sheet(wb, summary, "Summary");
 
-// ── Build merged Excel ────────────────────────────────────────
-function buildMergedExcel(parsedExcel, pdfResults, periodLabel) {
-  const { wb, sheetName, raw } = parsedExcel;
-  const ws = wb.Sheets[sheetName];
-
-  // PDF results map: serial → { grandTotal, printA5 }
-  const pdfMap = {};
-  pdfResults.forEach(r => { if (r.serial) pdfMap[r.serial] = r; });
-
-  let matched = 0, unmatched = 0;
-
-  parsedExcel.rows.forEach(row => {
-    const excelRow = row.rowIdx + 1; // 1-based for XLSX
-    const pdf = pdfMap[row.serial];
-
-    if (pdf) {
-      matched++;
-      const totalNew = pdf.grandTotal || 0;
-      const a5New    = pdf.printA5    || 0;
-
-      // col J (index 9)  = TotalNew
-      XLSX.utils.sheet_add_aoa(ws, [[totalNew]], { origin: { r: row.rowIdx, c: 9 } });
-      // col K (index 10) = A5new
-      XLSX.utils.sheet_add_aoa(ws, [[a5New]],    { origin: { r: row.rowIdx, c: 10 } });
-    } else {
-      unmatched++;
-    }
-  });
-
-  return { wb, matched, unmatched, total: parsedExcel.rows.length };
+  XLSX.writeFile(wb, filename);
 }
 
 export default function MergePanel() {
-  const [excelFile, setExcelFile] = useState(null);
-  const [pdfFile,   setPdfFile]   = useState(null);
-  const [status,    setStatus]    = useState("idle"); // idle | loading | done | error
-  const [pct,       setPct]       = useState(0);
-  const [msg,       setMsg]       = useState("");
-  const [result,    setResult]    = useState(null);  // { matched, unmatched, total, wb }
-  const [errMsg,    setErrMsg]    = useState("");
-  const [periodLabel, setPeriodLabel] = useState("");
+  const [pdfFile,  setPdfFile]  = useState(null);
+  const [status,   setStatus]   = useState("idle");
+  const [pct,      setPct]      = useState(0);
+  const [msg,      setMsg]      = useState("");
+  const [rows,     setRows]     = useState([]);
+  const [errMsg,   setErrMsg]   = useState("");
+  const [warnMsg,  setWarnMsg]  = useState("");
+  const [liveCount,setLiveCount]= useState(0);
+  const [reportName, setReportName] = useState("");
 
-  const excelRef = useRef(null);
-  const pdfRef   = useRef(null);
-  const abortRef = useRef(false);
-  const rlUntil  = useRef(0);
-  const cache    = useRef({});
+  const pdfRef    = useRef(null);
+  const abortRef  = useRef(false);
+  const rlUntil   = useRef(0);
+  const cache     = useRef({});
 
+  // ── Render page to base64 ──────────────────────────────────────
   const toBase64 = useCallback(async (pdfDoc, pageNum) => {
     if (cache.current[pageNum]) return cache.current[pageNum];
     const page = await pdfDoc.getPage(pageNum);
@@ -106,40 +85,45 @@ export default function MergePanel() {
     return b64;
   }, []);
 
+  // ── Call API with aggressive retry ────────────────────────────
   const callBatch = useCallback(async (images, pageNums) => {
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
       if (abortRef.current) return pageNums.map(p => ({ page: p, serial: null }));
       const now = Date.now();
-      if (now < rlUntil.current) await new Promise(r => setTimeout(r, rlUntil.current - now + 300));
-      if (attempt > 0) await new Promise(r => setTimeout(r, Math.min(1500 * Math.pow(2, attempt - 1), 20000)));
+      if (now < rlUntil.current)
+        await new Promise(r => setTimeout(r, rlUntil.current - now + 500));
+      if (attempt > 0)
+        await new Promise(r => setTimeout(r, Math.min(800 * Math.pow(1.8, attempt - 1), 20000)));
       try {
         const res = await fetch("/api/extract", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ images, pageNums }),
         });
-        if (res.status === 429) { rlUntil.current = Date.now() + 15000; continue; }
+        if (res.status === 429 || res.status === 529) {
+          rlUntil.current = Date.now() + 20000;
+          continue;
+        }
         if (!res.ok) continue;
         const data = await res.json();
-        return data.results ?? pageNums.map(p => ({ page: p, serial: null }));
+        const results = data.results ?? pageNums.map(p => ({ page: p, serial: null }));
+        // If got serial → success; if null → retry unless last attempt
+        const hasSerial = results.some(r => r?.serial);
+        if (hasSerial || attempt === MAX_RETRY - 1) return results;
+        // null result on non-last attempt → retry silently
       } catch (_) {}
     }
     return pageNums.map(p => ({ page: p, serial: null }));
   }, []);
 
+  // ── Main process ───────────────────────────────────────────────
   async function handleProcess() {
-    if (!excelFile || !pdfFile) return;
-    setStatus("loading"); setPct(0); setMsg(""); setErrMsg(""); setResult(null);
-    abortRef.current = false; rlUntil.current = 0; cache.current = {};
+    if (!pdfFile) return;
+    setStatus("loading"); setPct(0); setRows([]); setErrMsg(""); setWarnMsg("");
+    setLiveCount(0); abortRef.current = false; rlUntil.current = 0; cache.current = {};
 
     try {
-      // 1. Parse Excel
-      setMsg("📊 กำลังอ่านไฟล์ Excel...");
-      const excelBuf = await excelFile.arrayBuffer();
-      const parsed   = parseExcel(new Uint8Array(excelBuf));
-      setMsg(`📊 Excel: พบ ${parsed.rows.length} เครื่องพิมพ์`);
-
-      // 2. Load PDF.js
+      // Load PDF.js
       if (!window.pdfjsLib) {
         await new Promise((resolve, reject) => {
           const s = document.createElement("script");
@@ -153,11 +137,20 @@ export default function MergePanel() {
 
       const pdfDoc = await window.pdfjsLib.getDocument({ data: await pdfFile.arrayBuffer() }).promise;
       const total  = pdfDoc.numPages;
-      setMsg(`📄 PDF: ${total} หน้า — กำลังส่ง AI อ่านข้อมูล...`);
+      setMsg(`📄 PDF: ${total} หน้า — เริ่มอ่าน...`);
 
-      // 3. Process PDF (parallel workers)
+      // Pre-render ทุกหน้าพร้อมกัน
+      setMsg(`🖼 กำลัง render ${total} หน้า...`);
+      await Promise.all(
+        Array.from({ length: total }, (_, i) => toBase64(pdfDoc, i + 1))
+      );
+      setPct(10);
+      setMsg(`✅ Render ครบ ${total} หน้า — ส่ง AI อ่าน...`);
+
+      // ── Pass 1: parallel workers ──────────────────────────────
       const queue     = Array.from({ length: total }, (_, i) => i + 1);
       const collected = [];
+      const nullPages = new Set();
       let   processed = 0;
 
       const worker = async (wid) => {
@@ -166,33 +159,82 @@ export default function MergePanel() {
           while (batch.length < BATCH && queue.length > 0) batch.push(queue.shift());
           if (!batch.length) break;
           try {
-            const images  = await Promise.all(batch.map(p => toBase64(pdfDoc, p)));
+            const images  = [await toBase64(pdfDoc, batch[0])];
             const results = await callBatch(images, batch);
-            results.forEach(r => { if (r?.serial) collected.push(r); });
-          } catch (_) {}
-          processed += batch.length;
-          setPct(Math.round((processed / total) * 100));
-          setMsg(`⚡ W${wid}: ${batch[batch.length - 1]}/${total} — อ่านได้ ${collected.length} เครื่อง`);
+            results.forEach(r => {
+              if (r?.serial) {
+                collected.push(r);
+                setLiveCount(c => c + 1);
+              } else {
+                nullPages.add(batch[0]);
+              }
+            });
+          } catch (_) { batch.forEach(p => nullPages.add(p)); }
+          processed++;
+          // 10-90% = pass1
+          setPct(10 + Math.round((processed / total) * 80));
+          setMsg(`⚡ W${wid}: ${processed}/${total} — พบ ${collected.length} เครื่อง`);
         }
       };
 
       await Promise.all(Array.from({ length: WORKERS }, (_, i) => worker(i + 1)));
 
-      // Dedupe PDF results by serial (keep latest)
-      const pdfMap = {};
+      // ── Pass 2: retry null pages one-by-one ──────────────────
+      const foundPages = new Set(collected.map(r => r.page));
+      const retryList  = [...nullPages].filter(p => !foundPages.has(p)).sort((a, b) => a - b);
+
+      if (retryList.length > 0 && !abortRef.current) {
+        setMsg(`🔄 Retry ${retryList.length} หน้า (pass 2)...`);
+        let ri = 0;
+        for (const p of retryList) {
+          if (abortRef.current) break;
+          try {
+            const images  = [await toBase64(pdfDoc, p)];
+            const results = await callBatch(images, [p]);
+            results.forEach(r => {
+              if (r?.serial && !foundPages.has(r.page)) {
+                collected.push(r);
+                foundPages.add(r.page);
+              }
+            });
+          } catch (_) {}
+          ri++;
+          setPct(90 + Math.round((ri / retryList.length) * 8));
+        }
+      }
+
+      // ── Dedupe by serial ──────────────────────────────────────
       collected.sort((a, b) => (a.page || 0) - (b.page || 0));
-      collected.forEach(r => { pdfMap[r.serial] = r; });
-      const pdfResults = Object.values(pdfMap);
+      const map = new Map();
+      collected.forEach(r => {
+        if (!r.serial) return;
+        if (map.has(r.serial)) {
+          const e = map.get(r.serial);
+          e.printA4    = (e.printA4    ?? 0) + (r.printA4    ?? 0);
+          e.printA5    = (e.printA5    ?? 0) + (r.printA5    ?? 0);
+          e.grandTotal = (e.grandTotal ?? 0) + (r.grandTotal ?? 0);
+        } else {
+          map.set(r.serial, {
+            ...r,
+            printA4:    r.printA4    ?? 0,
+            printA5:    r.printA5    ?? 0,
+            grandTotal: r.grandTotal ?? 0,
+          });
+        }
+      });
+      const finalRows = [...map.values()];
 
-      setMsg(`✅ PDF: อ่านได้ ${pdfResults.length} เครื่อง — กำลัง Merge...`);
-
-      // 4. Merge & build Excel
-      const { wb, matched, unmatched } = buildMergedExcel(parsed, pdfResults, periodLabel);
+      // ── Check coverage ────────────────────────────────────────
+      const coveredPages  = new Set(collected.map(r => r.page));
+      const missedPages   = Array.from({ length: total }, (_, i) => i + 1)
+        .filter(p => !coveredPages.has(p));
 
       setPct(100);
-      setResult({ wb, matched, unmatched, total: parsed.rows.length, pdfFound: pdfResults.length });
+      setRows(finalRows);
       setStatus("done");
-      setMsg(`✅ Merge สำเร็จ: Match ${matched}/${parsed.rows.length} เครื่อง`);
+      setMsg(`✅ เสร็จ — ${total} หน้า → ${finalRows.length} เครื่องพิมพ์`);
+      if (missedPages.length > 0)
+        setWarnMsg(`⚠️ หน้าที่ไม่มีข้อมูลปริ้นเตอร์ (${missedPages.length} หน้า): ${missedPages.slice(0, 20).join(", ")}${missedPages.length > 20 ? "..." : ""}`);
 
     } catch (err) {
       setErrMsg("เกิดข้อผิดพลาด: " + err.message);
@@ -201,77 +243,71 @@ export default function MergePanel() {
   }
 
   function handleExport() {
-    if (!result?.wb) return;
-    const baseName = excelFile.name.replace(/\.xlsx?$/i, "");
-    const suffix   = periodLabel ? `_${periodLabel}` : `_updated`;
-    XLSX.writeFile(result.wb, `${baseName}${suffix}.xlsx`);
+    if (!rows.length) return;
+    const base = pdfFile?.name.replace(/\.pdf$/i, "") || "printer_report";
+    const name = reportName || base;
+    buildExcel(rows, `${name}_${new Date().toISOString().slice(0,10)}.xlsx`);
   }
 
-  const dropStyle = (hasFile) => ({
-    border: `2px dashed ${hasFile ? "#38bdf8" : "#30363d"}`,
-    background: hasFile ? "rgba(56,189,248,.04)" : "#161b22",
-    borderRadius: 10, padding: "20px 16px", textAlign: "center",
+  const fmt = n => typeof n === "number" ? Math.floor(n).toLocaleString("en-US") : "—";
+
+  const dropStyle = (has) => ({
+    border: `2px dashed ${has ? "#38bdf8" : "#30363d"}`,
+    background: has ? "rgba(56,189,248,.04)" : "#161b22",
+    borderRadius: 10, padding: "28px 20px", textAlign: "center",
     cursor: "pointer", transition: "all .2s",
   });
 
   return (
-    <div style={{ maxWidth: 800, margin: "0 auto", padding: "28px 18px 64px", fontFamily: "'Sarabun',sans-serif", color: "#e6edf3" }}>
+    <div style={{ maxWidth: 800, margin: "0 auto", padding: "8px 0 64px", fontFamily: "'Sarabun',sans-serif", color: "#e6edf3" }}>
 
       {/* Title */}
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 18, fontWeight: 700, color: "#e6edf3" }}>🔄 Merge Excel + PDF</div>
-        <div style={{ fontSize: 13, color: "#8b949e", marginTop: 4 }}>โยน Excel เดิม + PDF งวดใหม่ → ได้ Excel อัปเดตอัตโนมัติ</div>
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 18, fontWeight: 700, color: "#e6edf3" }}>📄 อ่าน PDF → Export Excel</div>
+        <div style={{ fontSize: 13, color: "#8b949e", marginTop: 4 }}>อ่านครบทุกหน้า · retry อัตโนมัติ · แม่นยำสูงสุด</div>
       </div>
 
-      {/* Upload area */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
-
-        {/* Excel */}
-        <div onClick={() => excelRef.current?.click()}
-          onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f?.name.match(/\.xlsx?$/i)) setExcelFile(f); }}
-          style={dropStyle(!!excelFile)}>
-          <input ref={excelRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }}
-            onChange={e => { const f = e.target.files[0]; if (f) setExcelFile(f); }} />
-          <div style={{ fontSize: 28, marginBottom: 8 }}>📊</div>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{excelFile ? excelFile.name : "Excel เดิม"}</div>
-          <div style={{ fontSize: 12, color: "#8b949e", marginTop: 4 }}>
-            {excelFile ? `${(excelFile.size / 1024).toFixed(0)} KB` : "ไฟล์ .xlsx ที่มีข้อมูลงวดก่อน"}
-          </div>
+      {/* PDF drop zone */}
+      <div onClick={() => pdfRef.current?.click()}
+        onDragOver={e => e.preventDefault()}
+        onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f?.type === "application/pdf") setPdfFile(f); }}
+        style={dropStyle(!!pdfFile)}>
+        <input ref={pdfRef} type="file" accept=".pdf" style={{ display: "none" }}
+          onChange={e => { const f = e.target.files[0]; if (f) setPdfFile(f); }} />
+        <div style={{ fontSize: 36, marginBottom: 10 }}>📄</div>
+        <div style={{ fontSize: 15, fontWeight: 700, color: pdfFile ? "#38bdf8" : "#e6edf3" }}>
+          {pdfFile ? pdfFile.name : "วางไฟล์ PDF ที่นี่ หรือคลิกเพื่อเลือก"}
         </div>
-
-        {/* PDF */}
-        <div onClick={() => pdfRef.current?.click()}
-          onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f?.type === "application/pdf") setPdfFile(f); }}
-          style={dropStyle(!!pdfFile)}>
-          <input ref={pdfRef} type="file" accept=".pdf" style={{ display: "none" }}
-            onChange={e => { const f = e.target.files[0]; if (f) setPdfFile(f); }} />
-          <div style={{ fontSize: 28, marginBottom: 8 }}>📄</div>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{pdfFile ? pdfFile.name : "PDF งวดใหม่"}</div>
-          <div style={{ fontSize: 12, color: "#8b949e", marginTop: 4 }}>
-            {pdfFile ? `${(pdfFile.size / 1024 / 1024).toFixed(1)} MB` : "HP Printer Usage Report งวดล่าสุด"}
-          </div>
+        <div style={{ fontSize: 12, color: "#8b949e", marginTop: 5 }}>
+          {pdfFile ? `${(pdfFile.size / 1024 / 1024).toFixed(1)} MB` : "HP Printer Usage Report · ภาษาไทย + English"}
         </div>
       </div>
 
-      {/* Period label */}
-      <div style={{ marginBottom: 14 }}>
-        <label style={{ fontSize: 12, color: "#8b949e", display: "block", marginBottom: 5 }}>📅 งวดที่ / ชื่อไฟล์ผลลัพธ์ (ไม่บังคับ)</label>
-        <input type="text" value={periodLabel} onChange={e => setPeriodLabel(e.target.value)}
-          placeholder="เช่น งวด14 หรือ มีนาคม_2569"
+      {/* Report name */}
+      <div style={{ marginTop: 14, marginBottom: 14 }}>
+        <label style={{ fontSize: 12, color: "#8b949e", display: "block", marginBottom: 5 }}>📝 ชื่อไฟล์ผลลัพธ์ (ไม่บังคับ)</label>
+        <input type="text" value={reportName} onChange={e => setReportName(e.target.value)}
+          placeholder="เช่น KRH_มีนาคม_2569"
           style={{ width: "100%", padding: "10px 14px", borderRadius: 8, fontSize: 14, background: "#161b22", border: "1px solid #30363d", color: "#e6edf3", outline: "none", fontFamily: "'Sarabun',sans-serif", boxSizing: "border-box" }}
         />
       </div>
 
       {/* Buttons */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
-        <button onClick={handleProcess} disabled={!excelFile || !pdfFile || status === "loading"}
-          style={{ padding: "13px 0", border: "none", borderRadius: 9, fontSize: 14, fontWeight: 700, cursor: (!excelFile || !pdfFile || status === "loading") ? "not-allowed" : "pointer", background: (!excelFile || !pdfFile || status === "loading") ? "#1e293b" : "#38bdf8", color: (!excelFile || !pdfFile || status === "loading") ? "#4b5563" : "#0d1117", fontFamily: "'Sarabun',sans-serif" }}>
-          {status === "loading" ? "⏳ กำลังประมวลผล..." : "🔄 ประมวลผล"}
+        <button onClick={handleProcess} disabled={!pdfFile || status === "loading"}
+          style={{ padding: "13px 0", border: "none", borderRadius: 9, fontSize: 14, fontWeight: 700,
+            cursor: (!pdfFile || status === "loading") ? "not-allowed" : "pointer",
+            background: (!pdfFile || status === "loading") ? "#1e293b" : "#38bdf8",
+            color: (!pdfFile || status === "loading") ? "#4b5563" : "#0d1117",
+            fontFamily: "'Sarabun',sans-serif" }}>
+          {status === "loading" ? "⏳ กำลังอ่าน..." : "🔍 อ่านข้อมูล"}
         </button>
-        <button onClick={handleExport} disabled={status !== "done"}
-          style={{ padding: "13px 0", border: "none", borderRadius: 9, fontSize: 14, fontWeight: 700, cursor: status !== "done" ? "not-allowed" : "pointer", background: status !== "done" ? "#1e293b" : "#166534", color: status !== "done" ? "#4b5563" : "#fff", fontFamily: "'Sarabun',sans-serif" }}>
+        <button onClick={handleExport} disabled={status !== "done" || !rows.length}
+          style={{ padding: "13px 0", border: "none", borderRadius: 9, fontSize: 14, fontWeight: 700,
+            cursor: (status !== "done" || !rows.length) ? "not-allowed" : "pointer",
+            background: (status !== "done" || !rows.length) ? "#1e293b" : "#166534",
+            color: (status !== "done" || !rows.length) ? "#4b5563" : "#fff",
+            fontFamily: "'Sarabun',sans-serif" }}>
           📥 Export Excel
         </button>
       </div>
@@ -283,37 +319,69 @@ export default function MergePanel() {
             <span>{msg}</span><span>{pct}%</span>
           </div>
           <div style={{ height: 8, background: "#1e293b", borderRadius: 4, overflow: "hidden" }}>
-            <div style={{ height: "100%", width: `${pct}%`, background: "linear-gradient(90deg,#38bdf8,#6366f1)", borderRadius: 4, transition: "width .4s" }} />
+            <div style={{ height: "100%", width: `${pct}%`, background: "linear-gradient(90deg,#38bdf8,#6366f1)", borderRadius: 4, transition: "width .3s" }} />
+          </div>
+          <div style={{ fontSize: 11, color: "#4b5563", marginTop: 4, fontFamily: "monospace" }}>
+            พบ {liveCount} เครื่องแล้ว
           </div>
         </div>
       )}
 
-      {/* Error */}
-      {errMsg && (
-        <div style={{ padding: "11px 16px", borderRadius: 8, fontSize: 13, background: "rgba(248,81,73,.1)", border: "1px solid #f85149", color: "#fca5a5", marginBottom: 14 }}>❌ {errMsg}</div>
+      {/* Messages */}
+      {errMsg  && <div style={{ padding: "11px 16px", borderRadius: 8, fontSize: 13, background: "rgba(248,81,73,.1)", border: "1px solid #f85149", color: "#fca5a5", marginBottom: 14 }}>❌ {errMsg}</div>}
+      {status === "done" && <div style={{ padding: "11px 16px", borderRadius: 8, fontSize: 13, background: "rgba(63,185,80,.1)", border: "1px solid #3fb950", color: "#7ee787", marginBottom: 14 }}>✅ {msg}</div>}
+      {warnMsg && <div style={{ padding: "11px 16px", borderRadius: 8, fontSize: 13, background: "rgba(234,179,8,.1)", border: "1px solid #eab308", color: "#fde047", marginBottom: 14 }}>{warnMsg}</div>}
+
+      {/* Stats */}
+      {rows.length > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 20 }}>
+          {[
+            { label: "เครื่องทั้งหมด", val: rows.length,                                                          color: "#38bdf8" },
+            { label: "A4 Print รวม",   val: fmt(rows.reduce((s,r) => s+(r.printA4    ??0),0)),                     color: "#60a5fa" },
+            { label: "A5 Print รวม",   val: rows.reduce((s,r)=>s+(r.printA5??0),0).toLocaleString("en-US"),        color: "#fbbf24" },
+            { label: "Grand Total รวม",val: fmt(rows.reduce((s,r) => s+(r.grandTotal ??0),0)),                     color: "#7dd3fc" },
+          ].map(s => (
+            <div key={s.label} style={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
+              <div style={{ fontSize: 20, fontWeight: 800, color: s.color, fontFamily: "monospace" }}>{s.val}</div>
+              <div style={{ fontSize: 11, color: "#8b949e", marginTop: 3 }}>{s.label}</div>
+            </div>
+          ))}
+        </div>
       )}
 
-      {/* Result summary */}
-      {status === "done" && result && (
-        <>
-          <div style={{ padding: "11px 16px", borderRadius: 8, fontSize: 13, background: "rgba(63,185,80,.1)", border: "1px solid #3fb950", color: "#7ee787", marginBottom: 16 }}>
-            ✅ {msg}
+      {/* Table */}
+      {rows.length > 0 && (
+        <div style={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 12, overflow: "hidden" }}>
+          <div style={{ padding: "10px 18px", borderBottom: "1px solid #30363d", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 14, fontWeight: 700 }}>ผลการอ่านข้อมูล</span>
+            <span style={{ fontSize: 11, background: "#0d1117", border: "1px solid #30363d", borderRadius: 20, padding: "3px 10px", color: "#8b949e", fontFamily: "monospace" }}>{rows.length} เครื่อง</span>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
-            {[
-              { label: "เครื่องใน Excel", value: result.total,      color: "#38bdf8" },
-              { label: "Match สำเร็จ",   value: result.matched,     color: "#3fb950" },
-              { label: "ไม่พบใน PDF",    value: result.unmatched,   color: result.unmatched > 0 ? "#eab308" : "#4b5563" },
-            ].map(s => (
-              <div key={s.label} style={{ background: "#161b22", border: "1px solid #30363d", borderRadius: 10, padding: "14px 18px", textAlign: "center" }}>
-                <div style={{ fontSize: 24, fontWeight: 800, color: s.color, fontFamily: "monospace" }}>{s.value}</div>
-                <div style={{ fontSize: 11, color: "#8b949e", marginTop: 4 }}>{s.label}</div>
-              </div>
-            ))}
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead style={{ background: "#0d1117" }}>
+                <tr>
+                  {["#","หน้า PDF","Serial Number","Model","A4 Print","A5 Print","Grand Total"].map((h,i) => (
+                    <th key={h} style={{ padding: "9px 12px", textAlign: i > 3 ? "right" : "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".5px", color: "#8b949e", borderBottom: "1px solid #30363d", whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={r.serial + i} style={{ borderBottom: "1px solid #1c2128" }}>
+                    <td style={{ padding: "8px 12px", color: "#8b949e", fontFamily: "monospace" }}>{i+1}</td>
+                    <td style={{ padding: "8px 12px", color: "#4b5563", fontFamily: "monospace" }}>{r.page||"?"}</td>
+                    <td style={{ padding: "8px 12px", color: "#7dd3fc", fontWeight: 600, fontFamily: "monospace" }}>{r.serial}</td>
+                    <td style={{ padding: "8px 12px", color: "#8b949e" }}>{r.model}</td>
+                    <td style={{ padding: "8px 12px", textAlign: "right", color: (r.printA4??0)>0?"#60a5fa":"#4b5563", fontFamily: "monospace", fontWeight: (r.printA4??0)>0?700:400 }}>{fmt(r.printA4)}</td>
+                    <td style={{ padding: "8px 12px", textAlign: "right", color: (r.printA5??0)>0?"#fbbf24":"#4b5563", fontFamily: "monospace", fontWeight: (r.printA5??0)>0?700:400 }}>{(r.printA5??0).toLocaleString("en-US")}</td>
+                    <td style={{ padding: "8px 12px", textAlign: "right", color: "#e6edf3", fontFamily: "monospace", fontWeight: 700 }}>{fmt(r.grandTotal)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        </>
+        </div>
       )}
-
     </div>
   );
 }
